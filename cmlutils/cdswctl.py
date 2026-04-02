@@ -51,16 +51,22 @@ def _cdswctl_tmp_dir_path() -> str:
     return dirpath
 
 
-def obtain_cdswctl(host: str, ca_path: str, skip_tls_verification: bool = False) -> str:
+def obtain_cdswctl(host: str, ca_path: str) -> str:
     file_url = _get_cdswctl_download_url(host)
-    expected_cdswctl_path = _download_and_extract(file_url, ca_path=ca_path, skip_tls_verification=skip_tls_verification)
+    expected_cdswctl_path = _download_and_extract(file_url, ca_path=ca_path)
     logging.info(
         "Expected cdsw path for cdswctl for file transfer %s", expected_cdswctl_path
     )
     return expected_cdswctl_path
 
 
-def cdswctl_login(cdswctl_path: str, host: str, username: str, api_key: str):
+def cdswctl_login(cdswctl_path: str, host: str, username: str, api_key: str, ca_path: str = ""):
     logging.info("Logging into cdsw via cdswctl")
-    command = [cdswctl_path, "login", "-n", username, "-u", host, "-y", api_key]
-    return subprocess.run(command)
+    cmd = [cdswctl_path, "login", "-n", username, "-u", host, "-y", api_key]
+    
+    # Add insecure flag if SSL verification is disabled
+    if ca_path.lower() == "false":
+        cmd.append("--insecure-skip-verify")
+        logging.debug("Added --insecure-skip-verify flag to cdswctl login command")
+    
+    return subprocess.run(cmd)

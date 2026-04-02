@@ -19,9 +19,19 @@ def call_api_v1(
     api_key: str,
     json_data: dict = None,
     ca_path: str = "",
-    skip_tls_verification: bool = False,
 ) -> requests.Response:
+    import time
+
     url = urllib.parse.urljoin(host, endpoint)
+
+    # Check if verbose mode is enabled
+    verbose = os.environ.get('CMLUTILS_VERBOSE', 'False').lower() == 'true'
+    
+    if verbose:
+        logging.debug("API v1 Request: %s %s", method.upper(), url)
+        if json_data:
+            logging.debug("API v1 Request Body: %s", json.dumps(json_data, indent=2))
+
     s = requests.Session()
     retries = Retry(
         total=3,
@@ -32,14 +42,8 @@ def call_api_v1(
     s.mount("https://", HTTPAdapter(max_retries=retries))
     headers = {"Content-Type": "application/json"}
     resp = None
-    
-    # Determine SSL verification setting
-    if skip_tls_verification:
-        verify_setting = False
-    elif ca_path != "":
-        verify_setting = ca_path
-    else:
-        verify_setting = True
+
+    start_time = time.time()
     
     try:
         if json_data != None:
@@ -49,7 +53,7 @@ def call_api_v1(
                 auth=(api_key, ""),
                 headers=headers,
                 json=json_data,
-                verify=verify_setting,
+                verify=False if ca_path.lower() == "false" else (ca_path if ca_path != "" else True),
             )
         else:
             resp = s.request(
@@ -57,12 +61,33 @@ def call_api_v1(
                 url=url,
                 auth=(api_key, ""),
                 headers=headers,
-                verify=verify_setting,
+                verify=False if ca_path.lower() == "false" else (ca_path if ca_path != "" else True),
             )
+
+        elapsed_time = time.time() - start_time
+        
+        if verbose:
+            logging.debug("API v1 Response: %s (Status: %d, Time: %.2fs)", 
+                         url, resp.status_code, elapsed_time)
+            if resp.headers.get("content-type", "").startswith("application/json"):
+                try:
+                    response_data = resp.json()
+                    # Log only first few lines of response to avoid overwhelming logs
+                    response_str = json.dumps(response_data, indent=2)
+                    if len(response_str) > 1000:
+                        response_str = response_str[:1000] + "... (truncated)"
+                    logging.debug("API v1 Response Body: %s", response_str)
+                except:
+                    logging.debug("API v1 Response Body: (non-JSON or too large)")
+        
         resp.raise_for_status()  # Raise an exception for 4xx or 5xx errors
         return resp
     except requests.exceptions.RequestException as e:
-        if resp != None and "application/json" in resp.headers.get("content-type"):
+        elapsed_time = time.time() - start_time
+        if verbose:
+            logging.debug("API v1 Request Failed: %s (Time: %.2fs, Error: %s)", 
+                         url, elapsed_time, str(e))
+        if resp != None and "application/json" in resp.headers.get("content-type", ""):
             logging.error("Error response from API: %s", resp.json())
         raise
 
@@ -74,9 +99,19 @@ def call_api_v2(
     user_token: str,
     json_data: dict = None,
     ca_path: str = "",
-    skip_tls_verification: bool = False,
 ) -> requests.Response:
+    import time
+
     url = urllib.parse.urljoin(host, endpoint)
+    
+    # Check if verbose mode is enabled
+    verbose = os.environ.get('CMLUTILS_VERBOSE', 'False').lower() == 'true'
+    
+    if verbose:
+        logging.debug("API v2 Request: %s %s", method.upper(), url)
+        if json_data:
+            logging.debug("API v2 Request Body: %s", json.dumps(json_data, indent=2))
+
     s = requests.Session()
     retries = Retry(
         total=3,
@@ -91,14 +126,7 @@ def call_api_v2(
     }
     resp = None
     
-    # Determine SSL verification setting
-    if skip_tls_verification:
-        verify_setting = False
-    elif ca_path != "":
-        verify_setting = ca_path
-    else:
-        verify_setting = True
-    
+    start_time = time.time()
     try:
         if json_data != None:
             resp = s.request(
@@ -106,20 +134,40 @@ def call_api_v2(
                 url=url,
                 headers=headers,
                 json=json_data,
-                verify=verify_setting,
+                verify=False if ca_path.lower() == "false" else (ca_path if ca_path != "" else True),
             )
         else:
             resp = s.request(
                 method=method.upper(),
                 url=url,
                 headers=headers,
-                verify=verify_setting,
+                verify=False if ca_path.lower() == "false" else (ca_path if ca_path != "" else True),
             )
+
+        elapsed_time = time.time() - start_time
+        
+        if verbose:
+            logging.debug("API v2 Response: %s (Status: %d, Time: %.2fs)", 
+                         url, resp.status_code, elapsed_time)
+            if resp.headers.get("content-type", "").startswith("application/json"):
+                try:
+                    response_data = resp.json()
+                    # Log only first few lines of response to avoid overwhelming logs
+                    response_str = json.dumps(response_data, indent=2)
+                    if len(response_str) > 1000:
+                        response_str = response_str[:1000] + "... (truncated)"
+                    logging.debug("API v2 Response Body: %s", response_str)
+                except:
+                    logging.debug("API v2 Response Body: (non-JSON or too large)")
         resp.raise_for_status()  # Raise an exception for 4xx or 5xx errors
         return resp
     except requests.exceptions.RequestException as e:
+        elapsed_time = time.time() - start_time
+        if verbose:
+            logging.debug("API v2 Request Failed: %s (Time: %.2fs, Error: %s)", 
+                         url, elapsed_time, str(e))
         logging.warning(f"Error: {e}")
-        if resp != None and "application/json" in resp.headers.get("content-type"):
+        if resp != None and "application/json" in resp.headers.get("content-type", ""):
             logging.error("Error response from API: %s", resp.json())
         raise
 

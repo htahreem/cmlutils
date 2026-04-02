@@ -6,7 +6,7 @@ from typing import List
 
 from requests import HTTPError
 
-from cmlutils.constants import ApiV1Endpoints
+from cmlutils.constants import ApiV1Endpoints, ApiV2Endpoints
 from cmlutils.directory_utils import (
     does_directory_exist,
     get_project_data_dir_path,
@@ -17,7 +17,7 @@ from cmlutils.projects import (
     is_project_configured_with_runtimes,
 )
 from cmlutils.script_models import ValidationResponse, ValidationResponseStatus
-from cmlutils.utils import call_api_v1
+from cmlutils.utils import call_api_v1, call_api_v2
 
 
 class ImportValidators(metaclass=ABCMeta):
@@ -244,25 +244,66 @@ class ProjectBelongsToUserValidator(ExportValidators):
         self.skip_tls_verification = skip_tls_verification
 
     def validate(self) -> ValidationResponse:
-        endpoint = Template(ApiV1Endpoints.PROJECT.value).substitute(
-            owner=self.username, project_name=self.project_slug
-        )
+        # Use V2 API to search for project (works for admins regardless of ownership)
         try:
-            response = call_api_v1(
+            # Get V2 API token
+            from datetime import datetime, timedelta
+            import json
+            import urllib.parse
+            
+            endpoint_api_key = Template(ApiV1Endpoints.API_KEY.value).substitute(
+                username=self.username
+            )
+            json_data = {
+                "expiryDate": (datetime.now() + timedelta(weeks=1)).strftime(
+                    "%Y-%m-%dT%H:%M:%SZ"
+                )
+            }
+            response_key = call_api_v1(
+                host=self.host,
+                endpoint=endpoint_api_key,
+                method="POST",
+                api_key=self.apiv1_key,
+                json_data=json_data,
+                ca_path=self.ca_path,
+            )
+            apiv2_key = response_key.json()["apiKey"]
+            
+            # Search for project using V2 API
+            search_option = {"name": self.project_name}
+            encoded_option = urllib.parse.quote(json.dumps(search_option).replace('"', '"'))
+            endpoint = Template(ApiV2Endpoints.SEARCH_PROJECT.value).substitute(
+                search_option=encoded_option
+            )
+            response = call_api_v2(
                 host=self.host,
                 endpoint=endpoint,
                 method="GET",
-                api_key=self.apiv1_key,
+                user_token=apiv2_key,
                 ca_path=self.ca_path,
-                skip_tls_verification=self.skip_tls_verification,
             )
+            project_list = response.json()["projects"]
+            
+            # Check if project exists
+            for project in project_list:
+                if project["name"] == self.project_name:
+                    return ValidationResponse(
+                        validation_name=self.validation_name,
+                        validation_msg="Project is present",
+                        validation_status=ValidationResponseStatus.PASSED,
+                    )
+            
+            # Project not found
+            logging.error("Project does not exist")
             return ValidationResponse(
                 validation_name=self.validation_name,
-                validation_msg="Project is present",
-                validation_status=ValidationResponseStatus.PASSED,
+                validation_msg="Project - {} does not exist. Ensure that the project name provided is correct.".format(
+                    self.project_name
+                ),
+                validation_status=ValidationResponseStatus.FAILED,
             )
-        except HTTPError:
-            logging.error("Project does not exist")
+        except Exception as e:
+            logging.error(f"Project validation error: {e}")
             return ValidationResponse(
                 validation_name=self.validation_name,
                 validation_msg="Project - {} does not exist. Ensure that the project name provided is correct.".format(
@@ -312,6 +353,15 @@ class RsyncRuntimeAddonExistsExportValidator(ExportValidators):
         self.skip_tls_verification = skip_tls_verification
 
     def validate(self) -> ValidationResponse:
+        # Skip validation if no V1 API key (rsync check requires V1 API)
+        if not self.apiv1_key:
+            logging.info("Skipping rsync validation - V1 API key not configured")
+            return ValidationResponse(
+                validation_name=self.validation_name,
+                validation_msg="validation skipped (no V1 API key)",
+                validation_status=ValidationResponseStatus.SKIPPED,
+            )
+        
         rsync_enabled_runtime_id = -1
         if is_project_configured_with_runtimes(
             host=self.host,
@@ -320,10 +370,9 @@ class RsyncRuntimeAddonExistsExportValidator(ExportValidators):
             api_key=self.apiv1_key,
             ca_path=self.ca_path,
             project_slug=self.project_slug,
-            skip_tls_verification=self.skip_tls_verification,
         ):
             rsync_enabled_runtime_id = get_rsync_enabled_runtime_id(
-                host=self.host, api_key=self.apiv1_key, ca_path=self.ca_path, skip_tls_verification=self.skip_tls_verification
+                host=self.host, api_key=self.apiv1_key, ca_path=self.ca_path
             )
             if rsync_enabled_runtime_id != -1:
                 return ValidationResponse(
@@ -390,18 +439,11 @@ def initialize_export_validators(
     apiv1_key: str,
     ca_path: str,
     project_slug: str,
-    skip_tls_verification: bool = False,
 ) -> List[ExportValidators]:
     return [
         TopLevelDirectoryValidator(top_level_directory=top_level_directory),
-        UsernameValidator(
-            host=host,
-            username=username,
-            apiv1_key=apiv1_key,
-            project_name=project_name,
-            ca_path=ca_path,
-            skip_tls_verification=skip_tls_verification,
-        ),
+        # UsernameValidator removed - V2 API will handle auth errors gracefully
+        # This avoids V1 API dependency and SSL issues with enterprise certificates
         ProjectBelongsToUserValidator(
             host=host,
             username=username,
@@ -409,7 +451,6 @@ def initialize_export_validators(
             project_name=project_name,
             ca_path=ca_path,
             project_slug=project_slug,
-            skip_tls_verification=skip_tls_verification,
         ),
         RsyncRuntimeAddonExistsExportValidator(
             host=host,
@@ -418,6 +459,5 @@ def initialize_export_validators(
             project_name=project_name,
             ca_path=ca_path,
             project_slug=project_slug,
-            skip_tls_verification=skip_tls_verification,
         ),
     ]

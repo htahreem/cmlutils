@@ -12,11 +12,12 @@ import click
 from cmlutils import constants
 from cmlutils.constants import (
     API_V1_KEY,
+    API_V2_KEY,
     CA_PATH_KEY,
     OUTPUT_DIR_KEY,
+    SOURCE_DIR_KEY,
     URL_KEY,
     USERNAME_KEY,
-    PROJECT_OWNER_USERNAME_KEY,
 )
 from cmlutils.directory_utils import get_project_metadata_file_path
 from cmlutils.projects import ProjectExporter, ProjectImporter
@@ -35,9 +36,13 @@ from cmlutils.validator import (
 )
 
 
-def _configure_project_command_logging(log_filedir: str, project_name: str):
+def _configure_project_command_logging(log_filedir: str, project_name: str, verbose: bool = False):
     os.makedirs(name=log_filedir, exist_ok=True)
     log_filename = log_filedir + constants.LOG_FILE
+
+    # Set log level based on verbose flag
+    log_level = logging.DEBUG if verbose else logging.INFO
+    
     logging.basicConfig(
         handlers=[
             logging.StreamHandler(sys.stdout),
@@ -45,9 +50,10 @@ def _configure_project_command_logging(log_filedir: str, project_name: str):
                 filename=log_filename, maxBytes=10000000, backupCount=5
             ),
         ],
-        level=logging.INFO,
+        level=log_level,
         format="%(asctime)s - %(levelname)s - %(custom_attribute)s - %(message)s",
         datefmt="%d/%m/%Y %H:%M:%S",
+        force=True  # Force reconfiguration if logging was already configured
     )
     old_factory = logging.getLogRecordFactory()
 
@@ -58,13 +64,16 @@ def _configure_project_command_logging(log_filedir: str, project_name: str):
 
     logging.setLogRecordFactory(record_factory)
 
+    # Store verbose setting in a way that can be accessed by other modules
+    os.environ['CMLUTILS_VERBOSE'] = str(verbose)
+
 
 def _read_config_file(file_path: str, project_name: str):
     output_config = {}
     config = ConfigParser()
     if os.path.exists(file_path):
         config.read(file_path)
-        keys = (USERNAME_KEY, URL_KEY, API_V1_KEY, OUTPUT_DIR_KEY)
+        keys = (USERNAME_KEY, URL_KEY, OUTPUT_DIR_KEY, SOURCE_DIR_KEY)
         for key in keys:
             try:
                 value = config.get(project_name, key)
@@ -72,11 +81,30 @@ def _read_config_file(file_path: str, project_name: str):
             except NoOptionError:
                 print("Key %s is missing from config file." % (key))
                 raise
+
+        # Read both API keys independently (at least one must be present)
+        apiv1_key = None
+        apiv2_key = None
+        
+        try:
+            apiv1_key = config.get(project_name, API_V1_KEY)
+        except NoOptionError:
+            pass  # V1 key is optional
+        
+        try:
+            apiv2_key = config.get(project_name, API_V2_KEY)
+        except NoOptionError:
+            pass  # V2 key is optional
+        
+        # At least one key must be provided
+        if not apiv1_key and not apiv2_key:
+            print("Error: Must provide either %s or %s (or both) in config file." % (API_V1_KEY, API_V2_KEY))
+            raise NoOptionError(API_V1_KEY, project_name)
+        
+        # Store both keys (may be None)
+        output_config[API_V1_KEY] = apiv1_key
+        output_config[API_V2_KEY] = apiv2_key
         output_config[CA_PATH_KEY] = config.get(project_name, CA_PATH_KEY, fallback="")
-        output_config[PROJECT_OWNER_USERNAME_KEY] = config.get(project_name, PROJECT_OWNER_USERNAME_KEY, fallback=config.get(project_name, USERNAME_KEY))
-        output_config[constants.SKIP_TLS_VERIFICATION_KEY] = config.getboolean(
-            project_name, constants.SKIP_TLS_VERIFICATION_KEY, fallback=False
-        )
         return output_config
     else:
         print("Validation error: cannot find config file:", file_path)
@@ -97,38 +125,44 @@ def project_cmd():
     help="Name of the project to be migrated. Make sure the name matches with the section name in export-config.ini file",
     required=True,
 )
-def project_export_cmd(project_name):
+@click.option(
+    "--verbose",
+    "-v",
+    is_flag=True,
+    help="Enable verbose logging including API call details",
+)
+def project_export_cmd(project_name, verbose):
     pexport = None
     config = _read_config_file(
         os.path.expanduser("~") + "/.cmlutils/export-config.ini", project_name
     )
 
     username = config[USERNAME_KEY]
-    project_owner_username = config[PROJECT_OWNER_USERNAME_KEY]
     url = config[URL_KEY]
     apiv1_key = config[API_V1_KEY]
+    apiv2_key = config[API_V2_KEY]
     output_dir = config[OUTPUT_DIR_KEY]
     ca_path = config[CA_PATH_KEY]
-    skip_tls_verification = config[constants.SKIP_TLS_VERIFICATION_KEY]
 
     output_dir = get_absolute_path(output_dir)
     ca_path = get_absolute_path(ca_path)
 
     log_filedir = os.path.join(output_dir, project_name, "logs")
-    _configure_project_command_logging(log_filedir, project_name)
+    _configure_project_command_logging(log_filedir, project_name, verbose)
     logging.info("Started exporting project: %s", project_name)
+    if verbose:
+        logging.debug("Verbose mode enabled - additional API call details will be logged")
     try:
         pobj = ProjectExporter(
             host=url,
             username=username,
-            project_owner_username=project_owner_username,
             project_name=project_name,
             api_key=apiv1_key,
             top_level_dir=output_dir,
             ca_path=ca_path,
             project_slug=project_name,
             owner_type="",
-            skip_tls_verification=skip_tls_verification,
+            apiv2_key=apiv2_key,
         )
         creator_username, project_slug, owner_type = pobj.get_creator_username()
         if creator_username is None:
@@ -138,17 +172,15 @@ def project_export_cmd(project_name):
                 username,
             )
             raise RuntimeError("Validation error")
-        logging.info("project creator username: %s", creator_username)
         logging.info("Begin validating for export.")
         validators = initialize_export_validators(
             host=url,
-            username=project_owner_username,
+            username=creator_username,
             project_name=project_name,
             top_level_directory=output_dir,
             apiv1_key=apiv1_key,
             ca_path=ca_path,
             project_slug=project_slug,
-            skip_tls_verification=skip_tls_verification,
         )
         for v in validators:
             validation_response = v.validate()
@@ -168,19 +200,18 @@ def project_export_cmd(project_name):
         pexport = ProjectExporter(
             host=url,
             username=username,
-            project_owner_username=project_owner_username,
             project_name=project_name,
             api_key=apiv1_key,
             top_level_dir=output_dir,
             ca_path=ca_path,
             project_slug=project_slug,
             owner_type=owner_type,
-            skip_tls_verification=skip_tls_verification,
+            apiv2_key=apiv2_key,
         )
         start_time = time.time()
         pexport.transfer_project_files(log_filedir=log_filedir)
         exported_data = pexport.dump_project_and_related_metadata()
-        print("\033[32m✔ Export of Project {} Successful \033[0m".format(project_name))
+        print("\033[32mSUCCESS: Export of Project {} Successful \033[0m".format(project_name))
         print(
             "\033[34m\tExported {} Jobs {}\033[0m".format(
                 exported_data.get("total_job"), exported_data.get("job_name_list")
@@ -224,6 +255,11 @@ def project_export_cmd(project_name):
     "-v",
     is_flag=True,
     help="Flag to automatically trigger migration validation after import.",
+)
+@click.option(
+    "--verbose",
+    is_flag=True,
+    help="Enable verbose logging including API call details",
 )
 def project_import_cmd(project_name, verify):
     pimport = None
@@ -643,6 +679,11 @@ def project_import_cmd(project_name, verify):
     "-p",
     help="Name of project migrated. Make sure the name matches with the section name in import-config.ini and export-config.ini file",
     required=True,
+)
+@click.option(
+    "--verbose",
+    is_flag=True,
+    help="Enable verbose logging including API call details",
 )
 def project_verify_cmd(project_name):
     pexport = None

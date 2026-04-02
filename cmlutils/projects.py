@@ -1,3 +1,4 @@
+from datetime import datetime, timedelta
 import json
 import logging
 import os
@@ -44,24 +45,44 @@ def is_project_configured_with_runtimes(
     api_key: str,
     ca_path: str,
     project_slug: str,
-    skip_tls_verification: bool = False,
 ) -> bool:
-    endpoint = Template(ApiV1Endpoints.PROJECT.value).substitute(
-        owner=username, project_name=project_slug
+    # Use V2 API - first get V2 token
+    endpoint_api_key = Template(ApiV1Endpoints.API_KEY.value).substitute(
+        username=username
     )
-    response = call_api_v1(
-        host=host, 
-        endpoint=endpoint, 
-        method="GET", 
-        api_key=api_key, 
-        ca_path=ca_path,
-        skip_tls_verification=skip_tls_verification,
+    json_data = {
+        "expiryDate": (datetime.now() + timedelta(weeks=1)).strftime(
+            "%Y-%m-%dT%H:%M:%SZ"
+        )
+    }
+    response_key = call_api_v1(
+        host=host,
+        endpoint=endpoint_api_key,
+        method="POST",
+        api_key=api_key,
+        json_data=json_data,
+        ca_path=ca_path
     )
-    response_dict = response.json()
-    return (
-        str(response_dict.get("default_project_engine_type", "")).lower()
-        == "ml_runtime"
+    apiv2_key = response_key.json()["apiKey"]
+    
+    # Search for the project using V2 API
+    search_option = {"name": project_name}
+    encoded_option = urllib.parse.quote(json.dumps(search_option).replace('"', '"'))
+    endpoint = Template(ApiV2Endpoints.SEARCH_PROJECT.value).substitute(
+        search_option=encoded_option
     )
+    response = call_api_v2(
+        host=host, endpoint=endpoint, method="GET", user_token=apiv2_key, ca_path=ca_path
+    )
+    project_list = response.json()["projects"]
+    if project_list:
+        for project in project_list:
+            if project["name"] == project_name:
+                # V2 API uses "default_engine_type" not "default_project_engine_type"
+                engine_type = str(project.get("default_engine_type", "")).lower()
+                logging.info(f"Project {project_name} engine type: {engine_type}")
+                return engine_type == "ml_runtime"
+    return False
 
 
 def get_ignore_files(
@@ -73,10 +94,9 @@ def get_ignore_files(
     ssh_port: str,
     project_slug: str,
     top_level_dir: str,
-    skip_tls_verification: bool = False,
 ) -> str:
     endpoint = Template(ApiV1Endpoints.PROJECT_FILE.value).substitute(
-        owner=username, project_name=project_slug, filename=constants.FILE_NAME
+        username=username, project_name=project_slug, filename=constants.FILE_NAME
     )
     try:
         logging.info(
@@ -90,7 +110,6 @@ def get_ignore_files(
             method="GET", 
             api_key=api_key, 
             ca_path=ca_path,
-            skip_tls_verification=skip_tls_verification,
         )
         a = response.text + "\n" + constants.FILE_NAME
         with open(
@@ -182,17 +201,37 @@ def parse_rsync_errors_from_output(stderr_output: str) -> list:
     return error_lines
 
 
-def get_rsync_enabled_runtime_id(host: str, api_key: str, ca_path: str, skip_tls_verification: bool = False) -> int:
-    runtime_list = get_cdsw_runtimes(host=host, api_key=api_key, ca_path=ca_path, skip_tls_verification=skip_tls_verification)
+def get_rsync_enabled_runtime_id(host: str, api_key: str, ca_path: str) -> int:
+    logging.info("Looking for rsync-enabled runtime...")
+    runtime_list = get_cdsw_runtimes(host=host, api_key=api_key, ca_path=ca_path)
+    logging.info(f"Found {len(runtime_list)} runtimes")
+    
     for runtime in runtime_list:
         if "rsync" in runtime["edition"].lower():
             logging.info("Rsync enabled runtime is available.")
             return runtime["id"]
-    logging.info("Rsync enabled runtime is not available")
+    logging.info("Rsync enabled runtime is not available, looking for fallback...")
+
+    # Fallback: if no rsync runtime, use the first available Python runtime
+    for runtime in runtime_list:
+        edition = runtime.get("edition", "").lower()
+        status = runtime.get("status", "")
+        logging.debug(f"Checking runtime: edition={edition}, status={status}")
+        if "python" in edition and status == "AVAILABLE":
+            logging.info(f"Using fallback Python runtime: {runtime.get('description', runtime.get('edition'))}")
+            return runtime["id"]
+    
+    # If still none, just return the first available runtime
+    if runtime_list and len(runtime_list) > 0:
+        runtime = runtime_list[0]
+        logging.info(f"Using first available runtime: {runtime.get('description', runtime.get('edition'))} (id={runtime.get('id')})")
+        return runtime["id"]
+    
+    logging.error("No runtimes available at all!")
     return -1
 
 
-def get_cdsw_runtimes(host: str, api_key: str, ca_path: str, skip_tls_verification: bool = False) -> list[dict[str, Any]]:
+def get_cdsw_runtimes(host: str, api_key: str, ca_path: str) -> list[dict[str, Any]]:
     endpoint = "api/v1/runtimes"
     response = call_api_v1(
         host=host, 
@@ -200,7 +239,6 @@ def get_cdsw_runtimes(host: str, api_key: str, ca_path: str, skip_tls_verificati
         method="GET", 
         api_key=api_key, 
         ca_path=ca_path,
-        skip_tls_verification=skip_tls_verification,
     )
     response_dict = response.json()
     return response_dict["runtimes"]
@@ -214,10 +252,17 @@ def transfer_project_files(
     project_name: str,
     log_filedir: str,
     exclude_file_path: str = None,
-    importignore_path: str = None,
 ):
     log_filename = log_filedir + constants.LOG_FILE
+    verbose = os.environ.get('CMLUTILS_VERBOSE', 'False').lower() == 'true'
+
     logging.info("Transfering files over ssh from sshport %s", sshport)
+    if verbose:
+        logging.debug("Transfer details - Source: %s, Destination: %s, SSH Port: %s", 
+                     source, destination, sshport)
+        logging.debug("Using exclude file: %s", exclude_file_path if exclude_file_path else "None")
+        logging.debug("Retry limit set to: %d", retry_limit)
+
     ssh_directive = f"ssh -p {sshport} -oStrictHostKeyChecking=no"
     subprocess_arguments = [
         "rsync",
@@ -232,49 +277,30 @@ def transfer_project_files(
         "--log-file",
         log_filename,
     ]
-    
-    # Add importignore exclusions if provided
-    if importignore_path is not None and os.path.exists(importignore_path):
-        logging.info("Using .importignore file for exclusions: %s", importignore_path)
-        subprocess_arguments.append(f"--exclude-from={importignore_path}")
 
     if exclude_file_path is not None:
         logging.info("Exclude file path is provided for file transfer")
         subprocess_arguments.append(f"--exclude-from={exclude_file_path}")
     subprocess_arguments.extend([source, destination])
     
-    return_code = 0
-    last_stderr = ""
-    
     for i in range(retry_limit):
-        result = subprocess.run(
-            subprocess_arguments,
-            stderr=subprocess.PIPE,
-            text=True
-        )
-        return_code = result.returncode
-        last_stderr = result.stderr or ""
+        if verbose:
+            logging.debug("Rsync attempt %d of %d", i + 1, retry_limit)
+            logging.debug("Executing rsync command: %s", " ".join(subprocess_arguments))
         
+        return_code = subprocess.call(subprocess_arguments)
         if return_code == 0:
             logging.info("Project files transfered successfully")
             return
+        
+        if verbose:
+            logging.debug("Rsync attempt %d failed with return code %d", i + 1, return_code)
+        
         logging.warning("Got non zero return code. Retrying...")
     if return_code != 0:
-        # Parse last stderr for read-only errors
-        readonly_errors = parse_rsync_errors_from_output(last_stderr)
-        
-        if readonly_errors:
-            logging.error("Retries exhausted for rsync.. Failing script for project %s", project_name)
-            logging.error("RSYNC FAILED: Read-only file system errors detected")
-            logging.error("Error details:")
-            for error_line in readonly_errors[:5]:
-                logging.error("  %s", error_line)
-            if importignore_path:
-                logging.error("")
-                logging.error("Verify the files, add them to: %s if there are any read-only file system errors to exclude the verification during import. Retry the import after adding the files", importignore_path)
-        else:
-            logging.error("Retries exhausted for rsync.. Failing script for project %s", project_name)
-
+        logging.error(
+            "Retries exhausted for rsync.. Failing script for project %s", project_name
+        )
         raise RuntimeError("Retries exhausted for rsync.. Failing script")
 
 
@@ -368,22 +394,114 @@ class ProjectExporter(BaseWorkspaceInteractor):
         self,
         host: str,
         username: str,
-        project_owner_username: str,
         project_name: str,
         api_key: str,
         top_level_dir: str,
         ca_path: str,
         project_slug: str,
         owner_type: str,
-        skip_tls_verification: bool = False,
+        apiv2_key: str = None,
     ) -> None:
         self._ssh_subprocess = None
         self.top_level_dir = top_level_dir
         self.project_id = None
-        self.project_owner_username = project_owner_username
         self.owner_type = owner_type
-        super().__init__(host, username, project_name, api_key, ca_path, project_slug, skip_tls_verification)
+        self._original_owner_username = None  # Cache for owner restoration
+        super().__init__(host, username, project_name, api_key, ca_path, project_slug, apiv2_key)
         self.metrics_data = dict()
+
+    # Get CDSW project info using API v2
+    def get_project_infov2(self, project_id: str = None):
+        if project_id is None:
+            # First get the project ID by searching for the project
+            project_id = self._get_project_id_by_name()
+        endpoint = Template(ApiV2Endpoints.GET_PROJECT.value).substitute(
+            project_id=project_id
+        )
+        response = call_api_v2(
+            host=self.host,
+            endpoint=endpoint,
+            method="GET",
+            user_token=self.apiv2_key,
+            ca_path=self.ca_path,
+        )
+        return response.json()
+    
+    # Get all applications list info using API v2
+    def get_app_listv2(self, project_id: str):
+        endpoint = Template(ApiV2Endpoints.APPS_LIST.value).substitute(
+            project_id=project_id
+        )
+        response = call_api_v2(
+            host=self.host,
+            endpoint=endpoint,
+            method="GET",
+            user_token=self.apiv2_key,
+            ca_path=self.ca_path,
+        )
+        return response.json().get("applications", [])
+
+    def _get_project_id_by_name(self):
+        """Helper method to get project ID by project name using V2 API
+        Tries multiple search strategies to find projects including public ones"""
+        
+        # Strategy 1: Search with name filter (finds owned projects)
+        search_option = {"name": self.project_name}
+        encoded_option = urllib.parse.quote(
+            json.dumps(search_option).replace('"', '"')
+        )
+        endpoint = Template(ApiV2Endpoints.SEARCH_PROJECT.value).substitute(
+            search_option=encoded_option
+        )
+        response = call_api_v2(
+            host=self.host,
+            endpoint=endpoint,
+            method="GET",
+            user_token=self.apiv2_key,
+            ca_path=self.ca_path,
+        )
+        project_list = response.json()["projects"]
+        if project_list:
+            for project in project_list:
+                if project["name"] == self.project_name:
+                    return project["id"]
+        
+        # Strategy 2: List all projects (no filter) - gets all accessible projects including public ones
+        logging.info(f"Project {self.project_name} not found in owned projects, searching all accessible projects...")
+        endpoint_all = "/api/v2/projects?page_size=1000&sort=-created_at"
+        
+        try:
+            response_all = call_api_v2(
+                host=self.host,
+                endpoint=endpoint_all,
+                method="GET",
+                user_token=self.apiv2_key,
+                ca_path=self.ca_path,
+            )
+            all_projects = response_all.json()["projects"]
+            
+            for project in all_projects:
+                if project["name"].lower() == self.project_name.lower():
+                    logging.info(f"Found project {self.project_name} in accessible projects list (ID: {project['id']})")
+                    return project["id"]
+        except Exception as e:
+            logging.warning(f"Could not search all accessible projects: {e}")
+        
+        raise RuntimeError(f"Project {self.project_name} not found in owned or accessible projects")
+    
+    # Get CDSW model info using API v2
+    def get_model_infov2(self, project_id: str, model_id: str):
+        endpoint = Template(ApiV2Endpoints.BUILD_MODEL.value).substitute(
+            project_id=project_id, model_id=model_id
+        )
+        response = call_api_v2(
+            host=self.host,
+            endpoint=endpoint,
+            method="GET",
+            user_token=self.apiv2_key,
+            ca_path=self.ca_path,
+        )
+        return response.json()
 
     # Get CDSW project info using API v1
     def get_project_infov1(self):
@@ -403,7 +521,7 @@ class ProjectExporter(BaseWorkspaceInteractor):
     # Get CDSW project env variables using API v1
     def get_project_env(self):
         endpoint = Template(ApiV1Endpoints.PROJECT_ENV.value).substitute(
-            owner=self.project_owner_username, project_name=self.project_slug
+            username=self.username, project_name=self.project_slug
         )
         response = call_api_v1(
             host=self.host,
@@ -411,57 +529,113 @@ class ProjectExporter(BaseWorkspaceInteractor):
             method="GET",
             api_key=self.api_key,
             ca_path=self.ca_path,
-            skip_tls_verification=self.skip_tls_verification,
         )
         return response.json()
 
     def get_creator_username(self):
-        next_page_exists = True
-        offset = 0
-        project_list = []
-
-        # Handle Pagination if exists
-        while next_page_exists:
-            # Note - projectName param makes LIKE query not the exact match
-            endpoint = Template(ApiV1Endpoints.PROJECTS_SUMMARY.value).substitute(
-                username=self.username,
-                projectName=self.project_name,
-                limit=constants.MAX_API_PAGE_LENGTH,
-                offset=offset * constants.MAX_API_PAGE_LENGTH,
-            )
-            logging.info("Endpoint: %s", endpoint)
-            response = call_api_v1(
-                host=self.host,
-                endpoint=endpoint,
-                method="GET",
-                api_key=self.api_key,
-                ca_path=self.ca_path,
-                skip_tls_verification=self.skip_tls_verification,
-            )
-
-            """
-            End loop            
-            a. If response len is less than MAX_API_PAGE_LENGTH 
-                => Possible if less number of records
-                => Possible if response is [] => len 0             
-            b. If length of response is greater than MAX_API_PAGE_LENGTH => If source is CDSW, as CDSW doesn't honor limit
-            c. If CDSW non-paginated response length is exactly the MAX_API_PAGE_LENGTH
-            """
-            if len(response.json()) != constants.MAX_API_PAGE_LENGTH:
-                next_page_exists = False
-            else:
-                # Handling if CDSW non-paginated response length is MAX_API_PAGE_LENGTH
-                if project_list == response.json():
-                    break
-
-            project_list = project_list + response.json()
-            offset = offset + 1
-
+        # Use V2 API to search for the project
+        search_option = {"name": self.project_name}
+        encoded_option = urllib.parse.quote(
+            json.dumps(search_option).replace('"', '"')
+        )
+        endpoint = Template(ApiV2Endpoints.SEARCH_PROJECT.value).substitute(
+            search_option=encoded_option
+        )
+        response = call_api_v2(
+            host=self.host,
+            endpoint=endpoint,
+            method="GET",
+            user_token=self.apiv2_key,
+            ca_path=self.ca_path,
+        )
+        project_list = response.json()["projects"]
+        
         if project_list:
             for project in project_list:
-                if project["name"] == self.project_name and project["owner"]["username"] == self.project_owner_username:
-                    return project.get("creator", {}).get("username", ""), project.get("slug_raw", ""), project.get("owner", {}).get("type", "")
+                if project["name"] == self.project_name:
+                    # V2 API structure
+                    owner_info = project.get("owner", {})
+                    creator_info = project.get("creator", {})
+                    
+                    # V2 API uses project name as slug (V1 had slug_raw field but V2 doesn't)
+                    project_slug = project.get("slug") or project.get("slug_raw") or self.project_name
+                    
+                    if owner_info.get("type") == constants.ORGANIZATION_TYPE:
+                        return (
+                            owner_info.get("username"),
+                            project_slug,
+                            constants.ORGANIZATION_TYPE,
+                        )
+                    else:
+                        return (
+                            creator_info.get("username"),
+                            project_slug,
+                            constants.USER_TYPE,
+                        )
         return None, None, None
+    
+    # Get all models list info using API v2
+    def get_models_listv2(self, project_id: str):
+        endpoint = Template(ApiV2Endpoints.MODELS_LIST.value).substitute(
+            project_id=project_id
+        )
+        response = call_api_v2(
+            host=self.host,
+            endpoint=endpoint,
+            method="GET",
+            user_token=self.apiv2_key,
+            ca_path=self.ca_path,
+        )
+        return response.json().get("models", [])
+    
+    # Get all jobs list info using API v2
+    def get_jobs_listv2(self, project_id: str):
+        endpoint = Template(ApiV2Endpoints.JOBS_LIST.value).substitute(
+            project_id=project_id
+        )
+        response = call_api_v2(
+            host=self.host,
+            endpoint=endpoint,
+            method="GET",
+            user_token=self.apiv2_key,
+            ca_path=self.ca_path,
+        )
+        return response.json().get("jobs", [])
+
+
+    # Get current user info
+    def get_current_user_info(self):
+        """Get the user information - we already have the username"""
+        # We don't need an API call - we already have the username
+        return {"username": self.username}
+    
+    # Update project owner using V2 API
+    def update_project_owner(self, project_id: str, new_owner_username: str):
+        """
+        Update the project owner using V2 API PATCH endpoint
+        
+        Args:
+            project_id: The project ID
+            new_owner_username: The username of the new owner
+        """
+        endpoint = Template(ApiV2Endpoints.UPDATE_PROJECT.value).substitute(
+            project_id=project_id
+        )
+        json_data = {
+            "owner": {
+                "username": new_owner_username
+            }
+        }
+        logging.info(f"Updating project {project_id} owner to: {new_owner_username}")
+        response = call_api_v2(
+            host=self.host,
+            endpoint=endpoint,
+            method="PATCH",
+            user_token=self.apiv2_key,
+            json_data=json_data,
+            ca_path=self.ca_path,
+        )
+        return response.json()
 
     # Get all models list info using API v1
     def get_models_listv1(self, project_id: int):
@@ -560,90 +734,180 @@ class ProjectExporter(BaseWorkspaceInteractor):
             skip_tls_verification=self.skip_tls_verification,
         )
         return response.json()
+    
+    # Restore original project owner
+    def restore_original_owner(self, project_id: str):
+        """
+        Restore the project owner to the original owner.
+        
+        Args:
+            project_id: The project ID
+        """
+        if self._original_owner_username:
+            logging.info(f"Restoring project owner to: {self._original_owner_username}")
+            self.update_project_owner(project_id, self._original_owner_username)
+            logging.info(f"Successfully restored project owner to {self._original_owner_username}")
+            self._original_owner_username = None
+        else:
+            logging.debug("No original owner cached, skipping restoration")
 
-    # Get all runtimes using API v1
+    # Get all runtimes using API v2
     def get_all_runtimes(self):
-        endpoint = ApiV1Endpoints.RUNTIMES.value
-        response = call_api_v1(
-            host=self.host,
-            endpoint=endpoint,
-            method="GET",
-            api_key=self.api_key,
-            ca_path=self.ca_path,
-            skip_tls_verification=self.skip_tls_verification,
-        )
-        return response.json()
-
+        """Get all runtimes using V2 API with pagination"""
+        all_runtimes = []
+        page_token = ""
+        
+        while True:
+            endpoint = Template(ApiV2Endpoints.RUNTIMES.value).substitute(
+                page_size=1000, page_token=page_token
+            )
+            response = call_api_v2(
+                host=self.host,
+                endpoint=endpoint,
+                method="GET",
+                user_token=self.apiv2_key,
+                ca_path=self.ca_path,
+            )
+            result = response.json()
+            all_runtimes.extend(result.get("runtimes", []))
+            
+            # Check if there are more pages
+            page_token = result.get("next_page_token", "")
+            if not page_token:
+                break
+        
+        return {"runtimes": all_runtimes}
+    
     def terminate_ssh_session(self):
         logging.info("Terminating ssh connection.")
         if self._ssh_subprocess is not None:
             self._ssh_subprocess.send_signal(signal.SIGINT)
         self._ssh_subprocess = None
 
-    def transfer_project_files(self, log_filedir: str):
-        rsync_enabled_runtime_id = -1
-        if is_project_configured_with_runtimes(
-            host=self.host,
-            username=self.project_owner_username,
-            project_name=self.project_name,
-            api_key=self.api_key,
-            ca_path=self.ca_path,
-            project_slug=self.project_slug,
-            skip_tls_verification=self.skip_tls_verification,
-        ):
-            rsync_enabled_runtime_id = get_rsync_enabled_runtime_id(
-                host=self.host, api_key=self.api_key, ca_path=self.ca_path, skip_tls_verification=self.skip_tls_verification
-            )
-        cdswctl_path = obtain_cdswctl(host=self.host, ca_path=self.ca_path, skip_tls_verification=self.skip_tls_verification)
-        login_response = cdswctl_login(
-            cdswctl_path=cdswctl_path,
-            host=self.host,
-            username=self.username,
-            api_key=self.api_key,
-        )
-        if login_response.returncode != 0:
-            logging.error("Cdswctl login failed")
-            raise RuntimeError
-        project_data_dir, _ = ensure_project_data_and_metadata_directory_exists(
-            self.top_level_dir, self.project_name
-        )
+    # Temporarily change project owner for export/import operations
+    def temporarily_change_owner_to_admin(self, project_id: str):
+        """
+        Temporarily change project owner to the current admin user.
+        Caches the original owner for later restoration.
+        
+        Args:
+            project_id: The project ID
+            
+        Returns:
+            bool: True if owner was changed, False if already owned by current user
+        """
+        # Get current project info
+        project_info = self.get_project_infov2(project_id=project_id)
+        current_owner = project_info.get("owner", {}).get("username")
+        
+        # Get current user (admin) info
+        current_user = self.get_current_user_info()
+        admin_username = current_user.get("username")
+        
+        logging.info(f"Current project owner: {current_owner}, Admin user: {admin_username}")
+        
+        # If already owned by admin, no need to change
+        if current_owner == admin_username:
+            logging.info("Project already owned by current admin user, no ownership change needed")
+            return False
+        
+        # Cache original owner
+        self._original_owner_username = current_owner
+        logging.info(f"Cached original owner: {current_owner}")
+        
+        # Change owner to admin
+        self.update_project_owner(project_id, admin_username)
+        logging.info(f"Successfully changed project owner from {current_owner} to {admin_username}")
+        return True
 
-        logging.info("Creating SSH connection")
-        ssh_subprocess, port = open_ssh_endpoint(
-            cdswctl_path=cdswctl_path,
-            project_name=self.project_name,
-            runtime_id=rsync_enabled_runtime_id,
-            project_slug="/".join([self.project_owner_username, self.project_slug]),
-        )
-        self._ssh_subprocess = ssh_subprocess
-        exclude_file_path = get_ignore_files(
-            host=self.host,
-            username=self.project_owner_username,
-            project_name=self.project_name,
-            api_key=self.api_key,
-            ca_path=self.ca_path,
-            ssh_port=port,
-            project_slug=self.project_slug,
-            top_level_dir=self.top_level_dir,
-            skip_tls_verification=self.skip_tls_verification,
-        )
-        test_file_size(
-            sshport=port,
-            output_dir=project_data_dir,
-            exclude_file_path=exclude_file_path,
-        )
-        transfer_project_files(
-            sshport=port,
-            source=constants.CDSW_PROJECTS_ROOT_DIR,
-            destination=project_data_dir,
-            retry_limit=3,
-            project_name=self.project_name,
-            exclude_file_path=exclude_file_path,
-            log_filedir=log_filedir,
-            importignore_path=None,
-        )
-        self.remove_cdswctl_dir(cdswctl_path)
-        self.terminate_ssh_session()
+    def transfer_project_files(self, log_filedir: str):
+        owner_changed = False
+        try:
+            # Get project ID and temporarily change owner if needed
+            if not self.project_id:
+                # Get project ID from V2 API
+                project_info = self.get_project_infov2()
+                self.project_id = project_info["id"]
+            
+            # Temporarily change owner to admin for file transfer
+            logging.info("Checking if project owner change is needed for file transfer...")
+            owner_changed = self.temporarily_change_owner_to_admin(self.project_id)
+
+            rsync_enabled_runtime_id = -1
+            project_uses_runtimes = is_project_configured_with_runtimes(
+                host=self.host,
+                username=self.username,
+                project_name=self.project_name,
+                api_key=self.api_key,
+                ca_path=self.ca_path,
+                project_slug=self.project_slug,
+            )
+            if project_uses_runtimes:
+                rsync_enabled_runtime_id = get_rsync_enabled_runtime_id(
+                    host=self.host, api_key=self.api_key, ca_path=self.ca_path
+                )
+                if rsync_enabled_runtime_id == -1:
+                    logging.error("Project is configured with runtimes but no runtime available for SSH session")
+                    raise RuntimeError("Cannot create SSH session: no runtime available")
+            cdswctl_path = obtain_cdswctl(host=self.host, ca_path=self.ca_path)
+            login_response = cdswctl_login(
+                cdswctl_path=cdswctl_path,
+                host=self.host,
+                username=self.username,
+                api_key=self.api_key,
+                ca_path=self.ca_path,
+            )
+            if login_response.returncode != 0:
+                logging.error("Cdswctl login failed")
+                raise RuntimeError
+            project_data_dir, _ = ensure_project_data_and_metadata_directory_exists(
+                self.top_level_dir, self.project_name
+            )
+
+            logging.info("Creating SSH connection")
+            ssh_subprocess, port = open_ssh_endpoint(
+                cdswctl_path=cdswctl_path,
+                project_name=self.project_name,
+                runtime_id=rsync_enabled_runtime_id,
+                project_slug=self.project_slug,
+            )
+            self._ssh_subprocess = ssh_subprocess
+            exclude_file_path = get_ignore_files(
+                host=self.host,
+                username=self.username,
+                project_name=self.project_name,
+                api_key=self.api_key,
+                ca_path=self.ca_path,
+                ssh_port=port,
+                project_slug=self.project_slug,
+                top_level_dir=self.top_level_dir,
+            )
+            test_file_size(
+                sshport=port,
+                output_dir=project_data_dir,
+                exclude_file_path=exclude_file_path,
+            )
+            transfer_project_files(
+                sshport=port,
+                source=constants.CDSW_PROJECTS_ROOT_DIR,
+                destination=project_data_dir,
+                retry_limit=3,
+                project_name=self.project_name,
+                exclude_file_path=exclude_file_path,
+                log_filedir=log_filedir,
+            )
+            self.remove_cdswctl_dir(cdswctl_path)
+            self.terminate_ssh_session()
+        finally:
+            # Always restore owner if it was changed, even if export fails
+            # dump_project_and_related_metadata() will also check, but this ensures restoration on failure
+            if self.project_id and self._original_owner_username:
+                try:
+                    logging.info("Restoring owner after file transfer failure/completion")
+                    self.restore_original_owner(self.project_id)
+                except Exception as e:
+                    logging.error(f"Failed to restore original project owner: {e}")
+                    # Log error but don't fail - the export already failed
 
     def verify_project_files(self, log_filedir: str):
         rsync_enabled_runtime_id = -1
@@ -675,7 +939,7 @@ class ProjectExporter(BaseWorkspaceInteractor):
             cdswctl_path=cdswctl_path,
             project_name=self.project_name,
             runtime_id=rsync_enabled_runtime_id,
-            project_slug="/".join([self.project_owner_username, self.project_slug]),
+            project_slug=self.project_slug,
         )
         self._ssh_subprocess = ssh_subprocess
         exclude_file_path = get_ignore_files(
@@ -687,7 +951,6 @@ class ProjectExporter(BaseWorkspaceInteractor):
             ssh_port=port,
             project_slug=self.project_slug,
             top_level_dir=self.top_level_dir,
-            skip_tls_verification=self.skip_tls_verification,
         )
         result = verify_files(
             sshport=port,
@@ -707,29 +970,94 @@ class ProjectExporter(BaseWorkspaceInteractor):
         self.remove_cdswctl_dir(cdswctl_path)
         self.terminate_ssh_session()
         return result
+    
+    def _create_placeholder_files_for_system_scripts(self, app_metadata_list):
+        """Create placeholder files for system scripts to enable migration"""
+        import os
+        
+        project_files_dir = get_project_data_dir_path(
+            top_level_dir=self.top_level_dir, project_name=self.project_name
+        )
+        
+        for app_metadata in app_metadata_list:
+            script_path = app_metadata.get("script", "")
+            app_name = app_metadata.get("name", "unknown")
+            
+            # Check if this is a system script (absolute path starting with /)
+            if script_path and script_path.startswith("/"):
+                # Convert absolute path to relative (remove leading /)
+                relative_script_path = script_path.lstrip("/")
+                
+                # Create full path in export directory
+                full_export_path = os.path.join(project_files_dir, relative_script_path)
+                
+                # Create directories if they don't exist
+                os.makedirs(os.path.dirname(full_export_path), exist_ok=True)
+                
+                # Create placeholder file
+                placeholder_content = f"""#!/usr/bin/env python3
+'''
+MIGRATION PLACEHOLDER for {app_name}
+
+This file was automatically created during project export to enable migration
+of applications with system-level scripts.
+
+Original script path: {script_path}
+Application: {app_name}
+
+IMPORTANT:
+This is a placeholder. The actual application uses a script from the runtime
+container. After migration:
+1. The application will be created successfully
+2. Update the script path in CML UI back to: {script_path}
+3. Or keep this placeholder and add your own application code here
+
+For Data Visualization apps, the system script will work automatically once
+the path is updated back to the original: {script_path}
+'''
+
+print(f"Placeholder for {app_name}")
+print(f"Original script: {script_path}")
+print("Please update the application script path in CML UI")
+"""
+                
+                try:
+                    with open(full_export_path, 'w') as f:
+                        f.write(placeholder_content)
+                    logging.info(f"✅ Created placeholder for system script: {relative_script_path}")
+                except Exception as e:
+                    logging.warning(f"Could not create placeholder for {script_path}: {e}")
 
     def _export_project_metadata(self):
         filepath = get_project_metadata_file_path(
             top_level_dir=self.top_level_dir, project_name=self.project_name
         )
         logging.info("Exporting project metadata to path %s", filepath)
-        project_info_resp = self.get_project_infov1()
+
+        verbose = os.environ.get('CMLUTILS_VERBOSE', 'False').lower() == 'true'
+        if verbose:
+            logging.debug("Fetching project information for project: %s", self.project_name)
+
+        project_info_resp = self.get_project_infov2()
+
+        if verbose:
+            logging.debug("Fetching project environment variables for project: %s", self.project_name)
+
         project_env = self.get_project_env()
         if "CDSW_APP_POLLING_ENDPOINT" not in project_env:
             project_env["CDSW_APP_POLLING_ENDPOINT"] = "."
         project_info_flatten = flatten_json_data(project_info_resp)
-        project_metadata = extract_fields(project_info_flatten, constants.PROJECT_MAP)
+        project_metadata = extract_fields(project_info_flatten, constants.PROJECT_MAPV2)
 
-        if project_info_flatten[
+        if project_info_flatten.get(
             "default_project_engine_type"
-        ] == constants.LEGACY_ENGINE and not bool(
+        ) == constants.LEGACY_ENGINE and not bool(
             legacy_engine_runtime_constants.engine_to_runtime_map()
         ):
             project_metadata["default_project_engine_type"] = constants.LEGACY_ENGINE
 
         project_metadata["template"] = "blank"
         project_metadata["environment"] = project_env
-        project_metadata["original_owner_username"] = self.project_owner_username
 
         # Create project in team context
         if self.owner_type == constants.ORGANIZATION_TYPE:
@@ -747,59 +1075,61 @@ class ProjectExporter(BaseWorkspaceInteractor):
             top_level_dir=self.top_level_dir, project_name=self.project_name
         )
         logging.info("Exporting models metadata to path %s", filepath)
-        model_list = self.get_models_listv1(project_id=self.project_id)
+        
+        verbose = os.environ.get('CMLUTILS_VERBOSE', 'False').lower() == 'true'
+        if verbose:
+            logging.debug("Fetching models list for project: %s (project_id: %s)", 
+                         self.project_name, self.project_id)
+        
+        # Use V2 API to get models list
+        model_list = self.get_models_listv2(project_id=self.project_id)
         model_name_list = []
         if len(model_list) == 0:
             logging.info("Models are not present in the project %s.", self.project_name)
+        elif verbose:
+            logging.debug("Found %d models in project %s", len(model_list), self.project_name)
         runtime_list = self.get_all_runtimes()
         model_metadata_list = []
         for model in model_list:
-            model_info_flatten = flatten_json_data(model)
-            model_metadata = extract_fields(model_info_flatten, constants.MODEL_MAP)
+            # Get detailed model info including builds
+            model_details = self.get_model_infov2(project_id=self.project_id, model_id=model["id"])
+            
+            model_metadata = {
+                "name": model.get("name", ""),
+                "description": model.get("description", "")
+            }
             model_name_list.append(model_metadata["name"])
-            if "authEnabled" in model:
-                model_metadata["disable_authentication"] = not model["authEnabled"]
-            if "latestModelBuild.runtimeId" in model_info_flatten:
-                runtime_obj = find_runtime(
-                    runtime_list=runtime_list["runtimes"],
-                    runtime_id=model_info_flatten["latestModelBuild.runtimeId"],
-                )
-                if runtime_obj != None:
-                    model_metadata.update(runtime_obj)
-            else:
-                if (
-                    model_info_flatten["project.default_project_engine_type"]
-                    == constants.LEGACY_ENGINE
-                ):
-                    # We are expecting LEGACY_ENGINE_MAP if the user want to migrate from an engine to runtime,
-                    # and the mapping should be given in LEGACY_ENGINE_MAP
-                    # If the mapping is not given/empty, the workloads will be created with the default engine images.
+            
+            if "auth_enabled" in model:
+                model_metadata["disable_authentication"] = not model["auth_enabled"]
+            
+            # Extract build information if available
+            if model_details.get("model_builds") and len(model_details["model_builds"]) > 0:
+                latest_build = model_details["model_builds"][0]
+                build_info_flatten = flatten_json_data(latest_build)
+                build_metadata = extract_fields(build_info_flatten, constants.MODEL_MAPV2)
+                model_metadata.update(build_metadata)
+                
+                if "runtime_id" in build_info_flatten:
+                    runtime_obj = find_runtime(
+                        runtime_list=runtime_list["runtimes"],
+                        runtime_id=build_info_flatten["runtime_id"],
+                    )
+                    if runtime_obj != None:
+                        model_metadata.update(runtime_obj)
+                elif build_info_flatten.get("kernel"):
+                    # Handle legacy engine
                     if bool(legacy_engine_runtime_constants.engine_to_runtime_map()):
-                        if model_info_flatten["latestModelBuild.kernel"] != "":
-                            runtime_identifier = legacy_engine_runtime_constants.engine_to_runtime_map().get(
-                                model_info_flatten["latestModelBuild.kernel"],
-                                legacy_engine_runtime_constants.engine_to_runtime_map().get(
-                                    "default"
-                                ),
-                            )
-                            model_metadata["runtime_identifier"] = runtime_identifier
-                        else:
-                            model_metadata[
-                                "runtime_identifier"
-                            ] = legacy_engine_runtime_constants.engine_to_runtime_map().get(
-                                "default"
-                            )
+                        runtime_identifier = legacy_engine_runtime_constants.engine_to_runtime_map().get(
+                            build_info_flatten["kernel"],
+                            legacy_engine_runtime_constants.engine_to_runtime_map().get("default")
+                        )
+                        model_metadata["runtime_identifier"] = runtime_identifier
                     else:
-                        if model_info_flatten["latestModelBuild.kernel"] != "":
-                            model_metadata["kernel"] = model_info_flatten[
-                                "latestModelBuild.kernel"
-                            ]
-                        else:
-                            model_metadata[
-                                "runtime_identifier"
-                            ] = legacy_engine_runtime_constants.engine_to_runtime_map().get(
-                                "default"
-                            )
+                        model_metadata["kernel"] = build_info_flatten["kernel"]
+                else:
+                    if bool(legacy_engine_runtime_constants.engine_to_runtime_map()):
+                        model_metadata["runtime_identifier"] = legacy_engine_runtime_constants.engine_to_runtime_map().get("default")
 
             model_metadata_list.append(model_metadata)
         write_json_file(file_path=filepath, json_data=model_metadata_list)
@@ -811,7 +1141,7 @@ class ProjectExporter(BaseWorkspaceInteractor):
             top_level_dir=self.top_level_dir, project_name=self.project_name
         )
         logging.info("Exporting application metadata to path %s", filepath)
-        app_list = self.get_app_listv1()
+        app_list = self.get_app_listv2(project_id=self.project_id)
         app_name_list = []
         if len(app_list) == 0:
             logging.info(
@@ -820,33 +1150,47 @@ class ProjectExporter(BaseWorkspaceInteractor):
         app_metadata_list = []
         for app in app_list:
             app_info_flatten = flatten_json_data(app)
-            app_metadata = extract_fields(app_info_flatten, constants.APPLICATION_MAP)
+            app_metadata = extract_fields(app_info_flatten, constants.APPLICATION_MAPV2)
             app_name_list.append(app_metadata["name"])
-            app_metadata["environment"] = app["environment"]
-            if (
-                app_info_flatten["currentDashboard.kernel"] != None
-                and app_info_flatten["currentDashboard.kernel"] != ""
-            ):
-                # We are expecting LEGACY_ENGINE_MAP if the user want to migrate from an engine to runtime,
-                # and the mapping should be given in LEGACY_ENGINE_MAP
-                # If the mapping is not given, the workloads will be created with the default engine images.
-                if bool(legacy_engine_runtime_constants.engine_to_runtime_map()):
+            app_metadata["environment"] = app.get("environment", {})
+            
+            # Capture complete runtime information from V2 API
+            runtime_identifier = app.get("runtime_identifier")
+            runtime_addons = app.get("runtime_addon_identifiers", [])
+            kernel = app.get("kernel", "")
+            
+            if runtime_identifier:
+                app_metadata["runtime_identifier"] = runtime_identifier
+                logging.debug(f"Captured runtime_identifier for app '{app_metadata['name']}': {runtime_identifier}")
+            
+            if runtime_addons:
+                app_metadata["runtime_addon_identifiers"] = runtime_addons
+                logging.debug(f"Captured runtime addons for app '{app_metadata['name']}': {runtime_addons}")
+            
+            if kernel:
+                app_metadata["kernel"] = kernel
+            
+            # Fallback to legacy engine mapping if no runtime_identifier captured
+            if not runtime_identifier:
+                legacy_kernel = app_info_flatten.get("runtime.kernel") or app_info_flatten.get("kernel")
+                if legacy_kernel and bool(legacy_engine_runtime_constants.engine_to_runtime_map()):
                     runtime_identifier = (
                         legacy_engine_runtime_constants.engine_to_runtime_map().get(
-                            app_info_flatten["currentDashboard.kernel"],
-                            legacy_engine_runtime_constants.engine_to_runtime_map().get(
-                                "default"
-                            ),
+                            legacy_kernel,
+                            legacy_engine_runtime_constants.engine_to_runtime_map().get("default"),
                         )
                     )
                     app_metadata["runtime_identifier"] = runtime_identifier
-                else:
-                    app_metadata["kernel"] = app_info_flatten["currentDashboard.kernel"]
+                    app_metadata["kernel"] = legacy_kernel
+            
             app_metadata_list.append(app_metadata)
 
         write_json_file(file_path=filepath, json_data=app_metadata_list)
         self.metrics_data["total_application"] = len(app_metadata_list)
         self.metrics_data["application_name_list"] = sorted(app_name_list)
+        
+        # Create placeholder files for system scripts to enable migration
+        self._create_placeholder_files_for_system_scripts(app_metadata_list)
 
     def collect_export_job_list(self):
         job_list = self.get_jobs_listv1()
@@ -903,24 +1247,48 @@ class ProjectExporter(BaseWorkspaceInteractor):
             top_level_dir=self.top_level_dir, project_name=self.project_name
         )
         logging.info("Exporting job metadata to path %s ", filepath)
-        job_list = self.get_jobs_listv1()
+        job_list = self.get_jobs_listv2(project_id=self.project_id)
         if len(job_list) == 0:
             logging.info("Jobs are not present in the project %s.", self.project_name)
         runtime_list = self.get_all_runtimes()
         job_metadata_list = []
         job_name_list = []
 
-        for job_item in job_list:
-            job = self.get_job_infov1(job_item["id"])
+        for job in job_list:
             job_info_flatten = flatten_json_data(job)
             job_metadata = extract_fields(job_info_flatten, constants.JOB_MAP)
             job_name_list.append(job_metadata["name"])
-            job_metadata["attachments"] = job.get("report", []).get("attachments", [])
+            job_metadata["attachments"] = job.get("report", {}).get("attachments", [])
             job_metadata["environment"] = job.get("environment", {})
-            if "runtime.id" in job_info_flatten:
+            # V2 API: Check for runtime_identifier first (modern approach)
+            runtime_identifier = job.get("runtime_identifier")
+            if runtime_identifier:
+                # Find the runtime details by image_identifier to get full metadata
+                runtime_obj = None
+                for runtime in runtime_list.get("runtimes", []):
+                    if runtime.get("image_identifier") == runtime_identifier:
+                        # Extract runtime details for import fallback matching
+                        runtime_obj = {
+                            "runtime_kernel": runtime.get("kernel"),
+                            "runtime_edition": runtime.get("edition"),
+                            "runtime_editor": runtime.get("editor"),
+                            "runtime_fullversion": runtime.get("full_version"),
+                            "runtime_shortversion": runtime.get("short_version"),
+                        }
+                        break
+                
+                if runtime_obj:
+                    job_metadata.update(runtime_obj)
+                    logging.debug(f"Captured runtime details for job '{job_metadata['name']}': {runtime_obj['runtime_kernel']}, {runtime_obj['runtime_edition']}, {runtime_obj['runtime_editor']}")
+                else:
+                    logging.warning(f"Runtime '{runtime_identifier}' not found in runtime list for job '{job_metadata['name']}'")
+            
+            # V1 API: Check for runtime ID (legacy approach)
+            elif "runtime.id" in job_info_flatten or "runtime_id" in job_info_flatten:
+                runtime_id = job_info_flatten.get("runtime.id") or job_info_flatten.get("runtime_id")
                 runtime_obj = find_runtime(
                     runtime_list=runtime_list["runtimes"],
-                    runtime_id=job_info_flatten["runtime.id"],
+                    runtime_id=runtime_id,
                 )
                 if runtime_obj != None:
                     job_metadata.update(runtime_obj)
@@ -931,43 +1299,24 @@ class ProjectExporter(BaseWorkspaceInteractor):
                         "default"
                     )
             else:
-                if (
-                    job_info_flatten["project.default_project_engine_type"]
-                    == constants.LEGACY_ENGINE
-                ):
-                    # We are expecting LEGACY_ENGINE_MAP if the user want to migrate from an engine to runtime,
-                    # and the mapping should be given in LEGACY_ENGINE_MAP
-                    # If the mapping is not given, the workloads will be created with the default engine images.
+                # Handle legacy engine (very old API)
+                kernel = job_info_flatten.get("kernel")
+                if kernel:
                     if bool(legacy_engine_runtime_constants.engine_to_runtime_map()):
-                        if job_info_flatten["kernel"] != "":
-                            runtime_identifier = legacy_engine_runtime_constants.engine_to_runtime_map().get(
-                                job_info_flatten["kernel"],
-                                legacy_engine_runtime_constants.engine_to_runtime_map().get(
-                                    "default"
-                                ),
-                            )
-                            job_metadata["runtime_identifier"] = runtime_identifier
-                        else:
-                            job_metadata[
-                                "runtime_identifier"
-                            ] = legacy_engine_runtime_constants.engine_to_runtime_map().get(
-                                "default"
-                            )
+                        runtime_identifier = legacy_engine_runtime_constants.engine_to_runtime_map().get(
+                            kernel,
+                            legacy_engine_runtime_constants.engine_to_runtime_map().get("default")
+                        )
+                        job_metadata["runtime_identifier"] = runtime_identifier
                     else:
-                        if job_info_flatten["kernel"] != "":
-                            job_metadata["kernel"] = job_info_flatten["kernel"]
-                        else:
-                            job_metadata[
-                                "runtime_identifier"
-                            ] = legacy_engine_runtime_constants.engine_to_runtime_map().get(
-                                "default"
-                            )
+                        job_metadata["kernel"] = kernel
                 else:
-                    job_metadata[
-                        "runtime_identifier"
-                    ] = legacy_engine_runtime_constants.engine_to_runtime_map().get(
-                        "default"
-                    )
+                    if bool(legacy_engine_runtime_constants.engine_to_runtime_map()):
+                        job_metadata[
+                            "runtime_identifier"
+                        ] = legacy_engine_runtime_constants.engine_to_runtime_map().get(
+                            "default"
+                        )
 
             job_metadata_list.append(job_metadata)
 
@@ -976,11 +1325,27 @@ class ProjectExporter(BaseWorkspaceInteractor):
         self.metrics_data["job_name_list"] = sorted(job_name_list)
 
     def dump_project_and_related_metadata(self):
-        self._export_project_metadata()
-        self._export_models_metadata()
-        self._export_application_metadata()
-        self._export_job_metadata()
-        return self.metrics_data
+        owner_changed = False
+        try:
+            # Temporarily change owner to admin if needed
+            if self.project_id:
+                logging.info("Checking if project owner change is needed for export...")
+                owner_changed = self.temporarily_change_owner_to_admin(self.project_id)
+            
+            self._export_project_metadata()
+            self._export_models_metadata()
+            self._export_application_metadata()
+            self._export_job_metadata()
+            return self.metrics_data
+        finally:
+            # Always restore original owner if we have one cached (even if owner_changed is False)
+            # This handles the case where owner was changed in transfer_project_files() but not here
+            if self.project_id and self._original_owner_username:
+                try:
+                    self.restore_original_owner(self.project_id)
+                except Exception as e:
+                    logging.error(f"Failed to restore original project owner: {e}")
+                    # Don't fail the export, but log the error
 
     def collect_export_project_data(self):
         proj_data_raw = self.get_project_infov1()

@@ -17,10 +17,11 @@ BASE_PATH_CDSWCTL = "/tmp/cdswctls"
 DEFAULT_ENTRIES = [".cache", ".local"]
 DEFAULT_IMPORTIGNORE_ENTRIES = [".snapshot", ".snapshot/"]
 USERNAME_KEY = "username"
-PROJECT_OWNER_USERNAME_KEY = "owner_username"
 URL_KEY = "url"
 API_V1_KEY = "apiv1_key"
+API_V2_KEY = "apiv2_key"
 OUTPUT_DIR_KEY = "output_dir"
+SOURCE_DIR_KEY = "source_dir"
 PROJECT_NAME_KEY = "project_name"
 CA_PATH_KEY = "ca_path"
 SKIP_TLS_VERIFICATION_KEY = "skip_tls_verification"
@@ -30,6 +31,7 @@ MAX_API_PAGE_LENGTH = 30
 class ApiV2Endpoints(Enum):
     PROJECTS = "/api/v2/projects"
     GET_PROJECT = "/api/v2/projects/$project_id"
+    UPDATE_PROJECT = "/api/v2/projects/$project_id"
     CREATE_MODEL = "/api/v2/projects/$project_id/models"
     BUILD_MODEL = "/api/v2/projects/$project_id/models/$model_id/builds"
     CREATE_APP = "/api/v2/projects/$project_id/applications"
@@ -48,15 +50,15 @@ class ApiV2Endpoints(Enum):
 
 
 class ApiV1Endpoints(Enum):
-    PROJECT = "api/v1/projects/$owner/$project_name"
-    PROJECT_ENV = "api/v1/projects/$owner/$project_name/environment"
-    PROJECT_FILE = "api/v1/projects/$owner/$project_name/files/$filename"
+    PROJECT = "api/v1/projects/$username/$project_name"
+    PROJECT_ENV = "api/v1/projects/$username/$project_name/environment"
+    PROJECT_FILE = "api/v1/projects/$username/$project_name/files/$filename"
     MODELS_LIST = "/api/altus-ds-1/models/list-models"
-    JOBS_LIST = "/api/v1/projects/$owner/$project_name/jobs"
-    APPS_LIST = "/api/v1/projects/$owner/$project_name/applications"
+    JOBS_LIST = "/api/v1/projects/$username/$project_name/jobs"
+    APPS_LIST = "/api/v1/projects/$username/$project_name/applications"
     MODEL_INFO = "/api/altus-ds-1/models/get-model"
-    JOB_INFO = "/api/v1/projects/$owner/$project_name/jobs/$job_id"
-    APP_INFO = "/api/v1/projects/$owner/$project_name/applications/$app_id"
+    JOB_INFO = "/api/v1/projects/$username/$project_name/jobs/$job_id"
+    APP_INFO = "/api/v1/projects/$username/$project_name/applications/$app_id"
     API_KEY = "/api/v1/users/$username/apikey"
     RUNTIMES = "/api/v1/runtimes"
     USER_INFO = "/api/v1/users/$username"
