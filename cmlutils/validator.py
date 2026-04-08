@@ -127,7 +127,7 @@ class UserNameImportValidator(ImportValidators):
 
 class RsyncRuntimeAddonExistsImportValidator(ImportValidators):
     def __init__(
-        self, host: str, username: str, apiv1_key: str, project_name: str, ca_path: str, skip_tls_verification: bool = False
+        self, host: str, username: str, apiv1_key: str, project_name: str, ca_path: str
     ):
         self.validation_name = "check if rsync is present"
         self.host = host
@@ -135,12 +135,20 @@ class RsyncRuntimeAddonExistsImportValidator(ImportValidators):
         self.apiv1_key = apiv1_key
         self.project_name = project_name
         self.ca_path = ca_path
-        self.skip_tls_verification = skip_tls_verification
 
     def validate(self) -> ValidationResponse:
+        # Skip validation if no V1 API key (rsync check requires V1 API)
+        if not self.apiv1_key:
+            logging.info("Skipping rsync validation - V1 API key not configured")
+            return ValidationResponse(
+                validation_name=self.validation_name,
+                validation_msg="validation skipped (no V1 API key)",
+                validation_status=ValidationResponseStatus.SKIPPED,
+            )
+        
         rsync_enabled_runtime_id = -1
         rsync_enabled_runtime_id = get_rsync_enabled_runtime_id(
-            host=self.host, api_key=self.apiv1_key, ca_path=self.ca_path, skip_tls_verification=self.skip_tls_verification
+            host=self.host, api_key=self.apiv1_key, ca_path=self.ca_path
         )
         if rsync_enabled_runtime_id != -1:
             return ValidationResponse(
@@ -404,7 +412,6 @@ def initialize_import_validators(
     top_level_directory: str,
     apiv1_key: str,
     ca_path: str,
-    skip_tls_verification: bool = False,
 ) -> List[ImportValidators]:
     return [
         DirectoriesAndFilesValidator(
@@ -412,21 +419,14 @@ def initialize_import_validators(
             project_name=project_name,
             top_level_directory=top_level_directory,
         ),
-        UserNameImportValidator(
-            host=host,
-            username=username,
-            apiv1_key=apiv1_key,
-            project_name=project_name,
-            ca_path=ca_path,
-            skip_tls_verification=skip_tls_verification,
-        ),
+        # UserNameImportValidator removed - V2 API will handle auth errors gracefully
+        # This avoids V1 API dependency and SSL issues with enterprise certificates
         RsyncRuntimeAddonExistsImportValidator(
             host=host,
             username=username,
             apiv1_key=apiv1_key,
             project_name=project_name,
             ca_path=ca_path,
-            skip_tls_verification=skip_tls_verification,
         ),
     ]
 

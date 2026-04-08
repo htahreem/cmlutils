@@ -61,7 +61,7 @@ def is_project_configured_with_runtimes(
         method="POST",
         api_key=api_key,
         json_data=json_data,
-        ca_path=ca_path
+        ca_path=ca_path,
     )
     apiv2_key = response_key.json()["apiKey"]
     
@@ -1382,102 +1382,238 @@ class ProjectImporter(BaseWorkspaceInteractor):
         top_level_dir: str,
         ca_path: str,
         project_slug: str,
-        skip_tls_verification: bool = False,
+        apiv2_key: str = None,
     ) -> None:
         self._ssh_subprocess = None
         self.top_level_dir = top_level_dir
-        super().__init__(host, username, project_name, api_key, ca_path, project_slug, skip_tls_verification)
+        self.project_id = None  # Will be populated from API
+        self._original_owner_username = None  # Cache for owner restoration
+        super().__init__(host, username, project_name, api_key, ca_path, project_slug, apiv2_key)
         self.metrics_data = dict()
+        # Track import outcomes for applications
+        self.import_tracking = {
+            "apps_imported_successfully": [],
+            "apps_removed_from_manifest": [],
+            "apps_skipped": [],
+            "apps_imported_with_fallback": []
+        }
 
     def get_creator_username(self):
-        next_page_exists = True
-        offset = 0
-        project_list = []
-
-        # Handle Pagination if exists
-        while next_page_exists:
-            # Note - projectName param makes LIKE query not the exact match
-            endpoint = Template(ApiV1Endpoints.PROJECTS_SUMMARY.value).substitute(
-                username=self.username,
-                projectName=self.project_name,
-                limit=constants.MAX_API_PAGE_LENGTH,
-                offset=offset * constants.MAX_API_PAGE_LENGTH,
-            )
-            response = call_api_v1(
-                host=self.host,
-                endpoint=endpoint,
-                method="GET",
-                api_key=self.api_key,
-                ca_path=self.ca_path,
-                skip_tls_verification=self.skip_tls_verification,
-            )
-
-            """
-            End loop           
-            a. If response len is less than MAX_API_PAGE_LENGTH 
-                => Possible if less number of records
-                => Possible if response is [] => len 0             
-            b. If length of response is greater than MAX_API_PAGE_LENGTH => If source is CDSW, as CDSW doesn't honor limit
-            c. If CDSW non-paginated response length is exactly the MAX_API_PAGE_LENGTH
-            """
-            if len(response.json()) != constants.MAX_API_PAGE_LENGTH:
-                next_page_exists = False
-            else:
-                # Handling if CDSW non-paginated response length is MAX_API_PAGE_LENGTH
-                if project_list == response.json():
-                    break
-
-            project_list = project_list + response.json()
-            offset = offset + 1
-
+        # Use V2 API to search for the project with enhanced search for team/shared projects
+        search_option = {"name": self.project_name}
+        encoded_option = urllib.parse.quote(
+            json.dumps(search_option).replace('"', '"')
+        )
+        endpoint = Template(ApiV2Endpoints.SEARCH_PROJECT.value).substitute(
+            search_option=encoded_option
+        )
+        response = call_api_v2(
+            host=self.host,
+            endpoint=endpoint,
+            method="GET",
+            user_token=self.apiv2_key,
+            ca_path=self.ca_path,
+        )
+        project_list = response.json()["projects"]
+        
         if project_list:
             for project in project_list:
                 if project["name"] == self.project_name:
-                    return project["creator"]["username"], project["slug_raw"]
-        return None
+                    creator_info = project.get("creator", {})
+                    # V2 API uses project name as slug (V1 had slug_raw field but V2 doesn't)
+                    project_slug = project.get("slug") or project.get("slug_raw") or self.project_name
+                    return creator_info.get("username"), project_slug
+        
+        # Enhanced search: List all accessible projects (including team/shared projects)
+        logging.info(f"Project {self.project_name} not found in basic search, trying all accessible projects...")
+        endpoint_all = "/api/v2/projects?page_size=1000&sort=-created_at"
+        
+        try:
+            response_all = call_api_v2(
+                host=self.host,
+                endpoint=endpoint_all,
+                method="GET",
+                user_token=self.apiv2_key,
+                ca_path=self.ca_path,
+            )
+            all_projects = response_all.json()["projects"]
+            
+            for project in all_projects:
+                if project["name"].lower() == self.project_name.lower():
+                    logging.info(f"Found project {self.project_name} in accessible projects (team/shared)")
+                    creator_info = project.get("creator", {})
+                    project_slug = project.get("slug") or project.get("slug_raw") or self.project_name
+                    return creator_info.get("username"), project_slug
+        except Exception as e:
+            logging.warning(f"Could not search all accessible projects: {e}")
+        
+        return None, None
+    
+    # Get current user info
+    def get_current_user_info(self):
+        """Get the user information - we already have the username"""
+        # We don't need an API call - we already have the username
+        return {"username": self.username}
+    
+     # Update project owner using V2 API
+    def update_project_owner(self, project_id: str, new_owner_username: str):
+        """
+        Update the project owner using V2 API PATCH endpoint
+        
+        Args:
+            project_id: The project ID
+            new_owner_username: The username of the new owner
+        """
+        endpoint = Template(ApiV2Endpoints.UPDATE_PROJECT.value).substitute(
+            project_id=project_id
+        )
+        json_data = {
+            "owner": {
+                "username": new_owner_username
+            }
+        }
+        logging.info(f"Updating project {project_id} owner to: {new_owner_username}")
+        response = call_api_v2(
+            host=self.host,
+            endpoint=endpoint,
+            method="PATCH",
+            user_token=self.apiv2_key,
+            json_data=json_data,
+            ca_path=self.ca_path,
+        )
+        return response.json()
+
+    
+    # Temporarily change project owner for export/import operations
+    def temporarily_change_owner_to_admin(self, project_id: str):
+        """
+        Temporarily change project owner to the current admin user.
+        Caches the original owner for later restoration.
+        
+        Args:
+            project_id: The project ID
+            
+        Returns:
+            bool: True if owner was changed, False if already owned by current user
+        """
+        # Get current project info
+        project_info = self.get_project_infov2(proj_id=project_id)
+        current_owner = project_info.get("owner", {}).get("username")
+        
+        # Get current user (admin) info
+        current_user = self.get_current_user_info()
+        admin_username = current_user.get("username")
+        
+        logging.info(f"Current project owner: {current_owner}, Admin user: {admin_username}")
+        
+        # If already owned by admin, no need to change
+        if current_owner == admin_username:
+            logging.info("Project already owned by current admin user, no ownership change needed")
+            return False
+        
+        # Cache original owner
+        self._original_owner_username = current_owner
+        logging.info(f"Cached original owner: {current_owner}")
+        
+        # Change owner to admin
+        self.update_project_owner(project_id, admin_username)
+        logging.info(f"Successfully changed project owner from {current_owner} to {admin_username}")
+        return True
 
     def transfer_project(self, log_filedir: str, verify=False):
+        owner_changed = False
         result = None
-        rsync_enabled_runtime_id = get_rsync_enabled_runtime_id(
-            host=self.host, api_key=self.apiv2_key, ca_path=self.ca_path, skip_tls_verification=self.skip_tls_verification
-        )
-        cdswctl_path = obtain_cdswctl(host=self.host, ca_path=self.ca_path, skip_tls_verification=self.skip_tls_verification)
-        login_response = cdswctl_login(
-            cdswctl_path=cdswctl_path,
-            host=self.host,
-            username=self.username,
-            api_key=self.api_key,
-        )
-        if login_response.returncode != 0:
-            logging.error("Cdswctl login failed")
-            raise RuntimeError
-        ssh_subprocess, port = open_ssh_endpoint(
-            cdswctl_path=cdswctl_path,
-            project_name=self.project_name,
-            runtime_id=rsync_enabled_runtime_id,
-            project_slug=self.project_slug,
-        )
-        self._ssh_subprocess = ssh_subprocess
-        
-        # Get importignore file (create if doesn't exist)
-        importignore_path = get_importignore_file(self.top_level_dir, self.project_name)
-        
-        transfer_project_files(
-            sshport=port,
-            source=os.path.join(
-                get_project_data_dir_path(
-                    top_level_dir=self.top_level_dir, project_name=self.project_name
-                ),
-                "",
-            ),
-            destination=constants.CDSW_PROJECTS_ROOT_DIR,
-            retry_limit=3,
-            project_name=self.project_name,
-            log_filedir=log_filedir,
-            importignore_path=importignore_path,
-        )
-        if verify:
-            result = verify_files(
+        try:
+            # Get project slug and ID from creator info
+            if not self.project_slug:
+                creator_username, project_slug = self.get_creator_username()
+                if project_slug:
+                    self.project_slug = project_slug
+                else:
+                    self.project_slug = self.project_name.lower()
+            
+            # Get project ID if not already set
+            if not self.project_id:
+                creator_username, project_slug = self.get_creator_username()
+                # Search for project to get ID using V2 API with enhanced search
+                from datetime import datetime, timedelta
+                import json
+                import urllib.parse
+                
+                # First try with name filter
+                search_filter = json.dumps({'name': self.project_name})
+                endpoint = f'/api/v2/projects?search_filter={urllib.parse.quote(search_filter)}&page_size=50&sort=-created_at'
+                
+                response = call_api_v2(
+                    host=self.host,
+                    endpoint=endpoint,
+                    method="GET",
+                    user_token=self.apiv2_key,
+                    ca_path=self.ca_path,
+                )
+                project_list = response.json().get("projects", [])
+                
+                for project in project_list:
+                    if project["name"].lower() == self.project_name.lower():
+                        self.project_id = project["id"]
+                        if not self.project_slug:
+                            self.project_slug = project.get("slug") or project.get("slug_raw") or self.project_name.lower()
+                        break
+                
+                # If not found, try enhanced search (all accessible projects including team/shared)
+                if not self.project_id:
+                    logging.info(f"Project {self.project_name} not found with name filter, searching all accessible projects...")
+                    endpoint_all = "/api/v2/projects?page_size=1000&sort=-created_at"
+                    
+                    try:
+                        response_all = call_api_v2(
+                            host=self.host,
+                            endpoint=endpoint_all,
+                            method="GET",
+                            user_token=self.apiv2_key,
+                            ca_path=self.ca_path,
+                        )
+                        all_projects = response_all.json().get("projects", [])
+                        
+                        for project in all_projects:
+                            if project["name"].lower() == self.project_name.lower():
+                                self.project_id = project["id"]
+                                if not self.project_slug:
+                                    self.project_slug = project.get("slug") or project.get("slug_raw") or self.project_name.lower()
+                                logging.info(f"Found project {self.project_name} in accessible projects (ID: {self.project_id})")
+                                break
+                    except Exception as e:
+                        logging.warning(f"Could not search all accessible projects: {e}")
+            
+            # Temporarily change owner to current user for file transfer
+            if self.project_id:
+                logging.info("Checking if project owner change is needed for import file transfer...")
+                owner_changed = self.temporarily_change_owner_to_admin(self.project_id)
+            else:
+                logging.info("Project ID not found, proceeding without owner change (new project will be created)")
+            
+            rsync_enabled_runtime_id = get_rsync_enabled_runtime_id(
+                host=self.host, api_key=self.apiv2_key, ca_path=self.ca_path
+            )
+            cdswctl_path = obtain_cdswctl(host=self.host, ca_path=self.ca_path)
+            login_response = cdswctl_login(
+                cdswctl_path=cdswctl_path,
+                host=self.host,
+                username=self.username,
+                api_key=self.api_key,
+                ca_path=self.ca_path,
+            )
+            if login_response.returncode != 0:
+                logging.error("Cdswctl login failed")
+                raise RuntimeError
+            ssh_subprocess, port = open_ssh_endpoint(
+                cdswctl_path=cdswctl_path,
+                project_name=self.project_name,
+                runtime_id=rsync_enabled_runtime_id,
+                project_slug=self.project_slug,
+            )
+            self._ssh_subprocess = ssh_subprocess
+            transfer_project_files(
                 sshport=port,
                 source=os.path.join(
                     get_project_data_dir_path(
@@ -1489,10 +1625,41 @@ class ProjectImporter(BaseWorkspaceInteractor):
                 retry_limit=3,
                 project_name=self.project_name,
                 log_filedir=log_filedir,
-                importignore_path=importignore_path,
             )
-        self.remove_cdswctl_dir(cdswctl_path)
-        return result
+            if verify:
+                result = verify_files(
+                    sshport=port,
+                    source=os.path.join(
+                        get_project_data_dir_path(
+                            top_level_dir=self.top_level_dir, project_name=self.project_name
+                        ),
+                        "",
+                    ),
+                    destination=constants.CDSW_PROJECTS_ROOT_DIR,
+                    retry_limit=3,
+                    project_name=self.project_name,
+                    log_filedir=log_filedir,
+                )
+            
+            self.remove_cdswctl_dir(cdswctl_path)
+            self.terminate_ssh_session()
+            return result
+        finally:
+            # Always restore owner if it was changed, even if import fails
+            if self.project_id and self._original_owner_username:
+                try:
+                    logging.info("Restoring owner after import file transfer")
+                    self.restore_original_owner(self.project_id)
+                except Exception as e:
+                    logging.error(f"Failed to restore original project owner: {e}")
+                    # Log error but don't fail - the import already failed
+            
+            # Always terminate SSH session to prevent leaks
+            if self._ssh_subprocess is not None:
+                try:
+                    self.terminate_ssh_session()
+                except Exception as e:
+                    logging.error(f"Failed to terminate SSH session: {e}")
 
     def verify_project(self, log_filedir: str):
         rsync_enabled_runtime_id = get_rsync_enabled_runtime_id(
@@ -1567,7 +1734,7 @@ class ProjectImporter(BaseWorkspaceInteractor):
     def convert_project_to_engine_based(self, proj_patch_metadata) -> bool:
         try:
             endpoint2 = Template(ApiV1Endpoints.PROJECT.value).substitute(
-                owner=self.username, project_name=self.project_name
+                username=self.username, project_name=self.project_name
             )
             response = call_api_v1(
                 host=self.host,
@@ -1576,7 +1743,6 @@ class ProjectImporter(BaseWorkspaceInteractor):
                 api_key=self.api_key,
                 json_data=proj_patch_metadata,
                 ca_path=self.ca_path,
-                skip_tls_verification=self.skip_tls_verification,
             )
             return True
         except KeyError as e:
@@ -1688,19 +1854,33 @@ class ProjectImporter(BaseWorkspaceInteractor):
             skip_tls_verification=self.skip_tls_verification,
         )
         return
-
-    # Get all runtimes using API v1
+    
+    # Get all runtimes using API v2
     def get_all_runtimes(self):
-        endpoint = ApiV1Endpoints.RUNTIMES.value
-        response = call_api_v1(
-            host=self.host,
-            endpoint=endpoint,
-            method="GET",
-            api_key=self.api_key,
-            ca_path=self.ca_path,
-            skip_tls_verification=self.skip_tls_verification,
-        )
-        return response.json()
+        """Get all runtimes using V2 API with pagination"""
+        all_runtimes = []
+        page_token = ""
+        
+        while True:
+            endpoint = Template(ApiV2Endpoints.RUNTIMES.value).substitute(
+                page_size=1000, page_token=page_token
+            )
+            response = call_api_v2(
+                host=self.host,
+                endpoint=endpoint,
+                method="GET",
+                user_token=self.apiv2_key,
+                ca_path=self.ca_path,
+            )
+            result = response.json()
+            all_runtimes.extend(result.get("runtimes", []))
+            
+            # Check if there are more pages
+            page_token = result.get("next_page_token", "")
+            if not page_token:
+                break
+        
+        return {"runtimes": all_runtimes}
 
     # Get spark runtime addons using API v2
     def get_spark_runtimeaddons(self):
@@ -1715,7 +1895,6 @@ class ProjectImporter(BaseWorkspaceInteractor):
             method="GET",
             user_token=self.apiv2_key,
             ca_path=self.ca_path,
-            skip_tls_verification=self.skip_tls_verification,
         )
         result_list = response.json()["runtime_addons"]
         if result_list:
@@ -1755,7 +1934,6 @@ class ProjectImporter(BaseWorkspaceInteractor):
                 method="GET",
                 user_token=self.apiv2_key,
                 ca_path=self.ca_path,
-                skip_tls_verification=self.skip_tls_verification,
             )
             project_list = response.json()["projects"]
             if project_list:
@@ -1782,7 +1960,6 @@ class ProjectImporter(BaseWorkspaceInteractor):
                 method="GET",
                 user_token=self.apiv2_key,
                 ca_path=self.ca_path,
-                skip_tls_verification=self.skip_tls_verification,
             )
             model_list = response.json()["models"]
             if model_list:
@@ -1836,7 +2013,6 @@ class ProjectImporter(BaseWorkspaceInteractor):
                 method="GET",
                 user_token=self.apiv2_key,
                 ca_path=self.ca_path,
-                skip_tls_verification=self.skip_tls_verification,
             )
             app_list = response.json()["applications"]
             if app_list:
@@ -1858,7 +2034,6 @@ class ProjectImporter(BaseWorkspaceInteractor):
             method="GET",
             user_token=self.apiv2_key,
             ca_path=self.ca_path,
-            skip_tls_verification=self.skip_tls_verification,
         )
         return response.json()
 
@@ -1886,7 +2061,6 @@ class ProjectImporter(BaseWorkspaceInteractor):
             method="GET",
             user_token=self.apiv2_key,
             ca_path=self.ca_path,
-            skip_tls_verification=self.skip_tls_verification,
         )
         return response.json()
 
@@ -1900,36 +2074,425 @@ class ProjectImporter(BaseWorkspaceInteractor):
             method="GET",
             user_token=self.apiv2_key,
             ca_path=self.ca_path,
-            skip_tls_verification=self.skip_tls_verification,
         )
         return response.json()
 
     def import_metadata(self, project_id: str):
-        models_metadata_filepath = get_models_metadata_file_path(
-            top_level_dir=self.top_level_dir, project_name=self.project_name
-        )
-        self.create_models(
-            project_id=project_id, models_metadata_filepath=models_metadata_filepath
-        )
+        owner_changed = False
+        try:
+            # Temporarily change owner to current user for metadata import
+            logging.info("Checking if project owner change is needed for metadata import...")
+            owner_changed = self.temporarily_change_owner_to_admin(project_id)
+            
+            models_metadata_filepath = get_models_metadata_file_path(
+                top_level_dir=self.top_level_dir, project_name=self.project_name
+            )
+            self.create_models(
+                project_id=project_id, models_metadata_filepath=models_metadata_filepath
+            )
 
-        app_metadata_filepath = get_applications_metadata_file_path(
-            top_level_dir=self.top_level_dir, project_name=self.project_name
-        )
-        self.create_stoppped_applications(
-            project_id=project_id, app_metadata_filepath=app_metadata_filepath
-        )
+            app_metadata_filepath = get_applications_metadata_file_path(
+                top_level_dir=self.top_level_dir, project_name=self.project_name
+            )
+            self.create_stoppped_applications(
+                project_id=project_id, app_metadata_filepath=app_metadata_filepath
+            )
 
-        job_metadata_filepath = get_jobs_metadata_file_path(
-            top_level_dir=self.top_level_dir, project_name=self.project_name
+            job_metadata_filepath = get_jobs_metadata_file_path(
+                top_level_dir=self.top_level_dir, project_name=self.project_name
+            )
+            self.create_paused_jobs(
+                project_id=project_id, job_metadata_filepath=job_metadata_filepath
+            )
+            self.get_project_infov2(proj_id=project_id)
+            self.collect_import_model_list(project_id=project_id)
+            self.collect_import_application_list(project_id=project_id)
+            self.collect_import_job_list(project_id=project_id)
+            
+            # Generate manual steps manifest if any applications need attention
+            self._generate_manual_steps_manifest()
+            
+            return self.metrics_data
+        finally:
+            # Always restore original owner if we have one cached
+            if project_id and self._original_owner_username:
+                try:
+                    logging.info("Restoring owner after metadata import")
+                    self.restore_original_owner(project_id)
+                except Exception as e:
+                    logging.error(f"Failed to restore original project owner: {e}")
+                    # Don't fail the import, but log the error
+
+    def _generate_human_readable_report(self, manifest: dict, report_path: str):
+        """Generate a human-readable text report for the migration"""
+        from datetime import datetime
+        
+        report_lines = [
+            "="*80,
+            "PROJECT MIGRATION REPORT",
+            "="*80,
+            "",
+            f"Migration Date: {manifest['migration_date']}",
+            f"Target Project: {manifest['target_project']}",
+            "",
+            "-"*80,
+            "",
+            "SUMMARY",
+            "",
+            "Applications:",
+            f"  Total Applications: {manifest['summary']['total_applications']}",
+            f"  Imported Successfully: {manifest['summary'].get('apps_imported_successfully', manifest['summary'].get('imported_successfully', 0))}",
+            f"  Imported with Modifications: {manifest['summary'].get('apps_imported_with_modifications', manifest['summary'].get('imported_with_modifications', 0))}",
+            f"  Imported with Fallback Runtime: {manifest['summary'].get('apps_imported_with_fallback', manifest['summary'].get('imported_with_fallback', 0))}",
+            f"  Removed from Import: {manifest['summary'].get('apps_removed_from_manifest', manifest['summary'].get('removed_from_manifest', 0))}",
+            f"  Skipped: {manifest['summary'].get('apps_skipped', manifest['summary'].get('skipped', 0))}",
+            "",
+            "Models:",
+            f"  Total Models: {manifest['summary'].get('total_models', 0)}",
+            f"  Imported Successfully: {manifest['summary'].get('models_imported_successfully', 0)}",
+            f"  Created Without Build: {manifest['summary'].get('models_created_without_build', 0)}",
+            f"  Imported with Fallback Runtime: {manifest['summary'].get('models_imported_with_fallback', 0)}",
+            "",
+            "Jobs:",
+            f"  Total Jobs: {manifest['summary'].get('total_jobs', 0)}",
+            f"  Imported Successfully: {manifest['summary'].get('jobs_imported_successfully', 0)}",
+            f"  Created with Fallback Runtime: {manifest['summary'].get('jobs_created_with_fallback', 0)}",
+            f"  Skipped: {manifest['summary'].get('jobs_skipped', 0)}",
+            "",
+        ]
+        
+        # Applications imported with modifications
+        if manifest.get("imported_with_modifications"):
+            report_lines.extend([
+                "-"*80,
+                "",
+                "APPLICATIONS REQUIRING MANUAL UPDATES",
+                "",
+                "The following applications were imported successfully but require manual",
+                "script path updates:",
+                "",
+            ])
+            
+            for app in manifest["imported_with_modifications"]:
+                report_lines.extend([
+                    f"Application: {app['name']}",
+                    "",
+                    f"  Runtime: {app['runtime']}",
+                    f"  Current Script: {app['current_script']}",
+                    f"  Required Script: {app['original_script']}",
+                    f"  Reason: {app['reason']}",
+                    "",
+                    "  Action Required:",
+                    f"  1. Go to CML UI -> Projects -> {manifest['target_project']} -> Applications",
+                    f"  2. Select application: {app['name']}",
+                    "  3. Click Settings",
+                    f"  4. Update Script field from '{app['current_script']}' to '{app['original_script']}'",
+                    "  5. Save and start the application",
+                    "",
+                ])
+        
+        # Applications removed from manifest
+        if manifest.get("removed_from_manifest"):
+            report_lines.extend([
+                "-"*80,
+                "",
+                "APPLICATIONS NOT IMPORTED",
+                "",
+                "The following applications could not be imported and require manual recreation:",
+                "",
+            ])
+            
+            for app in manifest["removed_from_manifest"]:
+                report_lines.extend([
+                    f"Application: {app['name']}",
+                    "",
+                    f"  Runtime: {app.get('runtime', 'N/A')}",
+                    f"  Script: {app.get('script', 'N/A')}",
+                    f"  Reason: {app['reason']}",
+                    f"  Action: {app['action']}",
+                    "",
+                ])
+        
+        # Applications skipped
+        if manifest.get("skipped_applications"):
+            report_lines.extend([
+                "-"*80,
+                "",
+                "APPLICATIONS SKIPPED",
+                "",
+                "The following applications were skipped during import:",
+                "",
+            ])
+            
+            for app in manifest["skipped_applications"]:
+                report_lines.extend([
+                    f"Application: {app['name']}",
+                    "",
+                    f"  Required Runtime: {app.get('runtime', 'N/A')}",
+                    f"  Script: {app.get('script', 'N/A')}",
+                    f"  Reason: {app['reason']}",
+                    f"  Action: {app['action']}",
+                    "",
+                ])
+        
+        # Applications imported with fallback
+        if manifest.get("imported_with_fallback"):
+            report_lines.extend([
+                "-"*80,
+                "",
+                "APPLICATIONS USING FALLBACK RUNTIME",
+                "",
+                "The following applications were imported with a fallback runtime:",
+                "",
+            ])
+            
+            for app in manifest["imported_with_fallback"]:
+                report_lines.extend([
+                    f"Application: {app['name']}",
+                    "",
+                    f"  Required Runtime: {app.get('required_runtime', 'N/A')}",
+                    f"  Fallback Runtime: {app.get('fallback_runtime', 'N/A')}",
+                    f"  Script: {app.get('script', 'N/A')}",
+                    f"  Action: {app.get('action', 'Test functionality')}",
+                    "",
+                ])
+        
+        # Models created without build
+        if manifest.get("models_created_without_build"):
+            report_lines.extend([
+                "-"*80,
+                "",
+                "MODELS CREATED WITHOUT BUILD",
+                "",
+                "The following models were created but builds failed. Manual rebuild required:",
+                "",
+            ])
+            
+            for model in manifest["models_created_without_build"]:
+                report_lines.extend([
+                    f"Model: {model['name']}",
+                    "",
+                    f"  Runtime: {model.get('runtime', 'N/A')}",
+                    f"  Reason: {model['reason']}",
+                    f"  Action: {model['action']}",
+                    "",
+                    "  Steps to Rebuild:",
+                    f"  1. Go to CML UI -> Projects -> {manifest['target_project']} -> Models",
+                    f"  2. Select model: {model['name']}",
+                    "  3. Click 'New Build'",
+                    "  4. Select appropriate runtime and build",
+                    "",
+                ])
+        
+        # Models imported with fallback
+        if manifest.get("models_imported_with_fallback"):
+            report_lines.extend([
+                "-"*80,
+                "",
+                "MODELS USING FALLBACK RUNTIME",
+                "",
+                "The following models were imported with a fallback runtime:",
+                "",
+            ])
+            
+            for model in manifest["models_imported_with_fallback"]:
+                report_lines.extend([
+                    f"Model: {model['name']}",
+                    "",
+                    f"  Required Runtime: {model.get('required_runtime', 'N/A')}",
+                    f"  Fallback Runtime: {model.get('fallback_runtime', 'N/A')}",
+                    f"  Action: {model.get('action', 'Test functionality')}",
+                    "",
+                ])
+        
+        # Jobs created with fallback
+        if manifest.get("jobs_created_with_fallback"):
+            report_lines.extend([
+                "-"*80,
+                "",
+                "JOBS USING FALLBACK RUNTIME",
+                "",
+                "The following jobs were created with a fallback runtime:",
+                "",
+            ])
+            
+            for job in manifest["jobs_created_with_fallback"]:
+                report_lines.extend([
+                    f"Job: {job['name']}",
+                    "",
+                    f"  Required Runtime: {job.get('required_runtime', 'N/A')}",
+                    f"  Fallback Runtime: {job.get('fallback_runtime', 'N/A')}",
+                    f"  Action: {job.get('action', 'Test functionality')}",
+                    "",
+                ])
+        
+        # Jobs skipped
+        if manifest.get("jobs_skipped"):
+            report_lines.extend([
+                "-"*80,
+                "",
+                "JOBS SKIPPED",
+                "",
+                "The following jobs were skipped during import:",
+                "",
+            ])
+            
+            for job in manifest["jobs_skipped"]:
+                report_lines.extend([
+                    f"Job: {job['name']}",
+                    "",
+                    f"  Runtime: {job.get('runtime', 'N/A')}",
+                    f"  Reason: {job['reason']}",
+                    f"  Action: {job['action']}",
+                    "",
+                    "  Steps to Recreate:",
+                    f"  1. Go to CML UI -> Projects -> {manifest['target_project']} -> Jobs",
+                    "  2. Click 'New Job'",
+                    f"  3. Set name: {job['name']}",
+                    "  4. Configure job with appropriate runtime and settings",
+                    "  5. Save",
+                    "",
+                ])
+        
+        # Recommendations
+        if manifest.get("recommendations"):
+            report_lines.extend([
+                "-"*80,
+                "",
+                "RECOMMENDATIONS",
+                "",
+            ])
+            for rec in manifest["recommendations"]:
+                report_lines.append(f"  - {rec}")
+            report_lines.append("")
+        
+        # Footer
+        report_lines.extend([
+            "-"*80,
+            "",
+            "ADDITIONAL RESOURCES",
+            "",
+            "  - JSON Manifest: manual-steps-required.json (for automation)",
+            "  - Migration Logs: Check the logs directory for detailed migration output",
+            "",
+            "="*80,
+            "",
+            f"Report generated: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}",
+            "",
+            "="*80,
+        ])
+        
+        # Write to file
+        try:
+            with open(report_path, 'w') as f:
+                f.write('\n'.join(report_lines))
+            logging.info(f"Generated human-readable report: {report_path}")
+        except Exception as e:
+            logging.warning(f"Failed to generate human-readable report: {e}")
+    
+    def _generate_manual_steps_manifest(self):
+        """Generate a manifest of applications and models that need manual attention"""
+        from datetime import datetime
+        
+        # Check if there are any applications needing attention
+        apps_needing_attention = (
+            len(self.import_tracking["apps_removed_from_manifest"]) +
+            len(self.import_tracking["apps_skipped"]) +
+            len(self.import_tracking["apps_imported_with_fallback"]) +
+            len(self.import_tracking.get("apps_imported_with_modifications", []))
         )
-        self.create_paused_jobs(
-            project_id=project_id, job_metadata_filepath=job_metadata_filepath
+        
+        # Check if there are any models needing attention
+        models_needing_attention = (
+            len(self.import_tracking.get("models_created_without_build", [])) +
+            len(self.import_tracking.get("models_imported_with_fallback", []))
         )
-        self.get_project_infov2(proj_id=project_id)
-        self.collect_import_model_list(project_id=project_id)
-        self.collect_import_application_list(project_id=project_id)
-        self.collect_import_job_list(project_id=project_id)
-        return self.metrics_data
+        
+        # Check if there are any jobs needing attention
+        jobs_needing_attention = (
+            len(self.import_tracking.get("jobs_created_with_fallback", [])) +
+            len(self.import_tracking.get("jobs_skipped", []))
+        )
+        
+        total_needing_attention = apps_needing_attention + models_needing_attention + jobs_needing_attention
+        
+        if total_needing_attention == 0:
+            logging.info("✅ All applications, models, and jobs imported successfully, no manual steps required")
+            return
+        
+        # Create manifest
+        manifest = {
+            "migration_date": datetime.now().isoformat(),
+            "source_project": "source",  # Will be filled by caller if needed
+            "target_project": self.project_name,
+            "summary": {
+                "total_applications": (
+                    len(self.import_tracking["apps_imported_successfully"]) + apps_needing_attention
+                ),
+                "apps_imported_successfully": len(self.import_tracking["apps_imported_successfully"]),
+                "apps_imported_with_modifications": len(self.import_tracking.get("apps_imported_with_modifications", [])),
+                "apps_imported_with_fallback": len(self.import_tracking["apps_imported_with_fallback"]),
+                "apps_removed_from_manifest": len(self.import_tracking["apps_removed_from_manifest"]),
+                "apps_skipped": len(self.import_tracking["apps_skipped"]),
+                "total_models": (
+                    len(self.import_tracking.get("models_imported_successfully", [])) + models_needing_attention
+                ),
+                "models_imported_successfully": len(self.import_tracking.get("models_imported_successfully", [])),
+                "models_created_without_build": len(self.import_tracking.get("models_created_without_build", [])),
+                "models_imported_with_fallback": len(self.import_tracking.get("models_imported_with_fallback", [])),
+                "total_jobs": (
+                    len(self.import_tracking.get("jobs_imported_successfully", [])) + jobs_needing_attention
+                ),
+                "jobs_imported_successfully": len(self.import_tracking.get("jobs_imported_successfully", [])),
+                "jobs_created_with_fallback": len(self.import_tracking.get("jobs_created_with_fallback", [])),
+                "jobs_skipped": len(self.import_tracking.get("jobs_skipped", []))
+            },
+            "imported_with_modifications": self.import_tracking.get("apps_imported_with_modifications", []),
+            "removed_from_manifest": self.import_tracking["apps_removed_from_manifest"],
+            "skipped_applications": self.import_tracking["apps_skipped"],
+            "imported_with_fallback": self.import_tracking["apps_imported_with_fallback"],
+            "models_created_without_build": self.import_tracking.get("models_created_without_build", []),
+            "models_imported_with_fallback": self.import_tracking.get("models_imported_with_fallback", []),
+            "jobs_created_with_fallback": self.import_tracking.get("jobs_created_with_fallback", []),
+            "jobs_skipped": self.import_tracking.get("jobs_skipped", []),
+            "recommendations": [
+                "Review applications imported with modifications and update script paths",
+                "Test applications imported with fallback runtimes",
+                "Manually recreate applications that were removed",
+                "Rebuild models that were created without builds",
+                "Test models imported with fallback runtimes",
+                "Test jobs imported with fallback runtimes",
+                "Manually recreate jobs that were skipped",
+                "Install missing runtimes if available"
+            ]
+        }
+        
+        # Save to file
+        import os
+        manifest_path = os.path.join(self.top_level_dir, self.project_name, "manual-steps-required.json")
+        os.makedirs(os.path.dirname(manifest_path), exist_ok=True)
+        
+        write_json_file(file_path=manifest_path, json_data=manifest)
+        
+        # Also generate human-readable report
+        report_path = os.path.join(self.top_level_dir, self.project_name, "MIGRATION_REPORT.txt")
+        self._generate_human_readable_report(manifest, report_path)
+        
+        logging.info(f"\n📋 Manual Steps Required:")
+        logging.info(f"  Applications:")
+        logging.info(f"    • Imported with modifications: {manifest['summary']['apps_imported_with_modifications']}")
+        logging.info(f"    • Removed from manifest: {manifest['summary']['apps_removed_from_manifest']}")
+        logging.info(f"    • Skipped: {manifest['summary']['apps_skipped']}")
+        logging.info(f"    • Imported with fallback: {manifest['summary']['apps_imported_with_fallback']}")
+        logging.info(f"  Models:")
+        logging.info(f"    • Created without build: {manifest['summary']['models_created_without_build']}")
+        logging.info(f"    • Imported with fallback: {manifest['summary']['models_imported_with_fallback']}")
+        logging.info(f"  Jobs:")
+        logging.info(f"    • Created with fallback: {manifest['summary']['jobs_created_with_fallback']}")
+        logging.info(f"    • Skipped: {manifest['summary']['jobs_skipped']}")
+        logging.info(f"  📁 JSON manifest: {manifest_path}")
+        logging.info(f"  📄 Human-readable report: {report_path}")
+
 
     def collect_imported_project_data(self, project_id: str):
         proj_data_raw = self.get_project_infov2(proj_id=project_id)
@@ -1956,6 +2519,11 @@ class ProjectImporter(BaseWorkspaceInteractor):
 
     def create_models(self, project_id: str, models_metadata_filepath: str):
         try:
+            verbose = os.environ.get('CMLUTILS_VERBOSE', 'False').lower() == 'true'
+            if verbose:
+                logging.debug("Starting model creation process for project_id: %s", project_id)
+                logging.debug("Reading models metadata from: %s", models_metadata_filepath)
+            
             runtime_list = self.get_all_runtimes()
             proj_with_runtime = is_project_configured_with_runtimes(
                 host=self.host,
@@ -1964,15 +2532,62 @@ class ProjectImporter(BaseWorkspaceInteractor):
                 api_key=self.api_key,
                 ca_path=self.ca_path,
                 project_slug=self.project_slug,
-                skip_tls_verification=self.skip_tls_verification,
             )
+            
+            if verbose:
+                logging.debug("Project configured with runtimes: %s", proj_with_runtime)
+            
+            # Initialize model tracking
+            if "models_imported_successfully" not in self.import_tracking:
+                self.import_tracking["models_imported_successfully"] = []
+            if "models_created_without_build" not in self.import_tracking:
+                self.import_tracking["models_created_without_build"] = []
+            if "models_imported_with_fallback" not in self.import_tracking:
+                self.import_tracking["models_imported_with_fallback"] = []
+            
             model_metadata_list = read_json_file(models_metadata_filepath)
             if model_metadata_list != None:
+                if verbose:
+                    logging.debug("Found %d models to import", len(model_metadata_list))
+                
                 for model_metadata in model_metadata_list:
+                    model_name = model_metadata.get("name", "unknown")
+                    
                     if not self.check_model_exist(
                         model_name=model_metadata["name"], proj_id=project_id
                     ):
                         model_metadata["project_id"] = project_id
+                        required_runtime = model_metadata.get("runtime_identifier", None)
+                        runtime_available = False
+                        used_fallback = False
+                        
+                        # Check if required runtime exists in target
+                        if required_runtime and proj_with_runtime:
+                            runtime_available = any(
+                                r.get("image_identifier") == required_runtime
+                                for r in runtime_list.get("runtimes", [])
+                            )
+                            
+                            if not runtime_available:
+                                logging.warning(
+                                    f"⚠️  Model '{model_name}' requires runtime '{required_runtime}' which is not available"
+                                )
+                                # Try to find fallback runtime
+                                if all(k in model_metadata for k in ["runtime_edition", "runtime_editor", "runtime_kernel"]):
+                                    fallback_runtime = get_best_runtime(
+                                        runtime_list["runtimes"],
+                                        model_metadata["runtime_edition"],
+                                        model_metadata["runtime_editor"],
+                                        model_metadata["runtime_kernel"],
+                                        model_metadata.get("runtime_shortversion", ""),
+                                        model_metadata.get("runtime_fullversion", ""),
+                                    )
+                                    if fallback_runtime:
+                                        logging.info(f"Using fallback runtime for model '{model_name}': {fallback_runtime}")
+                                        model_metadata["runtime_identifier"] = fallback_runtime
+                                        used_fallback = True
+                                        runtime_available = True
+                        
                         if (
                             not "runtime_identifier" in model_metadata
                             and proj_with_runtime
@@ -1994,29 +2609,97 @@ class ProjectImporter(BaseWorkspaceInteractor):
                                     "Couldn't locate runtime identifier for model %s",
                                     model_metadata["name"],
                                 )
-                                logging.info(
-                                    "Applying default runtime %s",
-                                    legacy_engine_runtime_constants.engine_to_runtime_map().get(
-                                        "default"
-                                    ),
-                                )
-                                model_metadata[
-                                    "runtime_identifier"
-                                ] = legacy_engine_runtime_constants.engine_to_runtime_map().get(
-                                    "default"
-                                )
-                        model_id = self.create_model_v2(
-                            proj_id=project_id, model_metadata=model_metadata
-                        )
-                        self.create_model_build_v2(
-                            proj_id=project_id,
-                            model_id=model_id,
-                            model_metadata=model_metadata,
-                        )
-                        logging.info(
-                            "Model- %s has been migrated successfully",
-                            model_metadata["name"],
-                        )
+                                # Try first available runtime
+                                if runtime_list.get("runtimes"):
+                                    first_runtime = runtime_list["runtimes"][0].get("image_identifier")
+                                    if first_runtime:
+                                        logging.info(f"Using first available runtime for model '{model_name}': {first_runtime}")
+                                        model_metadata["runtime_identifier"] = first_runtime
+                                        used_fallback = True
+                                    else:
+                                        logging.warning(f"No runtimes available, skipping build for model '{model_name}'")
+                                        model_metadata["runtime_identifier"] = None
+                        
+                        if verbose:
+                            logging.debug("Creating model: %s", model_metadata["name"])
+                        
+                        try:
+                            model_id = self.create_model_v2(
+                                proj_id=project_id, model_metadata=model_metadata
+                            )
+                            
+                            if verbose:
+                                logging.debug("Created model with ID: %s, attempting build...", model_id)
+                            
+                            # Try to create build, but don't crash if it fails
+                            build_created = False
+                            if model_metadata.get("runtime_identifier"):
+                                try:
+                                    self.create_model_build_v2(
+                                        proj_id=project_id,
+                                        model_id=model_id,
+                                        model_metadata=model_metadata,
+                                    )
+                                    build_created = True
+                                    
+                                    if used_fallback:
+                                        logging.info(f"✅ Model '{model_name}' created with fallback runtime")
+                                        self.import_tracking["models_imported_with_fallback"].append({
+                                            "name": model_name,
+                                            "required_runtime": required_runtime,
+                                            "fallback_runtime": model_metadata["runtime_identifier"],
+                                            "action": "Verify model functionality with the fallback runtime"
+                                        })
+                                    else:
+                                        logging.info(f"✅ Model '{model_name}' migrated successfully")
+                                        self.import_tracking["models_imported_successfully"].append({
+                                            "name": model_name,
+                                            "runtime": model_metadata.get("runtime_identifier", "default")
+                                        })
+                                
+                                except HTTPError as e:
+                                    error_message = str(e)
+                                    if hasattr(e, 'response') and e.response is not None:
+                                        try:
+                                            error_json = e.response.json()
+                                            error_message = error_json.get("message") or error_json.get("error") or str(e)
+                                        except:
+                                            pass
+                                    
+                                    logging.warning(f"⚠️  Failed to create build for model '{model_name}': {error_message}")
+                                    logging.info(f"Model '{model_name}' created but without build - manual intervention required")
+                                    self.import_tracking["models_created_without_build"].append({
+                                        "name": model_name,
+                                        "runtime": required_runtime or "unknown",
+                                        "reason": f"Build creation failed: {error_message}",
+                                        "action": "Manually rebuild the model in CML UI with an appropriate runtime"
+                                    })
+                            else:
+                                logging.info(f"⚠️  Model '{model_name}' created without build (no runtime available)")
+                                self.import_tracking["models_created_without_build"].append({
+                                    "name": model_name,
+                                    "runtime": required_runtime or "unknown",
+                                    "reason": "No suitable runtime available in target workspace",
+                                    "action": "Manually rebuild the model in CML UI after adding the required runtime"
+                                })
+                        
+                        except HTTPError as e:
+                            error_message = str(e)
+                            if hasattr(e, 'response') and e.response is not None:
+                                try:
+                                    error_json = e.response.json()
+                                    error_message = error_json.get("message") or error_json.get("error") or str(e)
+                                except:
+                                    pass
+                            
+                            logging.error(f"Failed to create model '{model_name}': {error_message}")
+                            self.import_tracking["models_created_without_build"].append({
+                                "name": model_name,
+                                "runtime": required_runtime or "unknown",
+                                "reason": f"Model creation failed: {error_message}",
+                                "action": "Manually recreate the model in CML UI"
+                            })
+                            continue
                     else:
                         logging.info(
                             "Skipping the already existing model- %s",
@@ -2030,8 +2713,10 @@ class ProjectImporter(BaseWorkspaceInteractor):
         except Exception as e:
             logging.error("Model migration failed")
             logging.error(f"Error: {e}")
-            raise
-
+            # Don't raise - log the error and continue with jobs
+            logging.info("Continuing with remaining imports despite model errors...")
+            return
+        
     def create_stoppped_applications(self, project_id: str, app_metadata_filepath: str):
         try:
             runtime_list = self.get_all_runtimes()
@@ -2042,7 +2727,6 @@ class ProjectImporter(BaseWorkspaceInteractor):
                 api_key=self.api_key,
                 ca_path=self.ca_path,
                 project_slug=self.project_slug,
-                skip_tls_verification=self.skip_tls_verification,
             )
             app_metadata_list = read_json_file(app_metadata_filepath)
             if app_metadata_list != None:
@@ -2051,34 +2735,207 @@ class ProjectImporter(BaseWorkspaceInteractor):
                         subdomain=app_metadata["subdomain"], proj_id=project_id
                     ):
                         app_metadata["project_id"] = project_id
-                        if (
-                            not "runtime_identifier" in app_metadata
-                            and proj_with_runtime
-                        ):
-                            runtime_identifier = get_best_runtime(
-                                runtime_list["runtimes"],
-                                app_metadata["runtime_edition"],
-                                app_metadata["runtime_editor"],
-                                app_metadata["runtime_kernel"],
-                                app_metadata["runtime_shortversion"],
-                                app_metadata["runtime_fullversion"],
-                            )
-                            if runtime_identifier != None:
-                                app_metadata["runtime_identifier"] = runtime_identifier
-                            else:
-                                app_metadata[
-                                    "runtime_identifier"
-                                ] = legacy_engine_runtime_constants.engine_to_runtime_map().get(
-                                    "default"
+                        
+                        # Check if all required runtime fields are present
+                        has_runtime_fields = all(
+                            field in app_metadata
+                            for field in [
+                                "runtime_edition",
+                                "runtime_editor",
+                                "runtime_kernel",
+                                "runtime_shortversion",
+                                "runtime_fullversion",
+                            ]
+                        )
+                        
+                        # For projects using runtimes, only set runtime_identifier if not already present from export
+                        if proj_with_runtime and not "runtime_identifier" in app_metadata:
+                            if has_runtime_fields:
+                                runtime_identifier = get_best_runtime(
+                                    runtime_list["runtimes"],
+                                    app_metadata["runtime_edition"],
+                                    app_metadata["runtime_editor"],
+                                    app_metadata["runtime_kernel"],
+                                    app_metadata["runtime_shortversion"],
+                                    app_metadata["runtime_fullversion"],
                                 )
-                        app_id = self.create_application_v2(
-                            proj_id=project_id, app_metadata=app_metadata
+                                if runtime_identifier != None:
+                                    app_metadata["runtime_identifier"] = runtime_identifier
+                                    logging.info(
+                                        f"Set runtime_identifier from runtime fields for app {app_metadata.get('name')}"
+                                    )
+                                else:
+                                    # Try first available runtime if no match found
+                                    if runtime_list and "runtimes" in runtime_list and runtime_list["runtimes"]:
+                                        first_runtime = runtime_list["runtimes"][0]
+                                        # V2 API returns snake_case fields
+                                        app_metadata["runtime_identifier"] = (
+                                            first_runtime.get("image_identifier") or first_runtime.get("full_version")
+                                        )
+                                        logging.info(
+                                            f"Using first available runtime for app {app_metadata.get('name')}: {app_metadata['runtime_identifier']}"
+                                        )
+                            else:
+                                # If runtime fields are missing, use first available runtime from workspace
+                                if runtime_list and "runtimes" in runtime_list and runtime_list["runtimes"]:
+                                    first_runtime = runtime_list["runtimes"][0]
+                                    # Use the first available runtime - V2 API returns snake_case fields
+                                    app_metadata["runtime_identifier"] = (
+                                        first_runtime.get("image_identifier") or first_runtime.get("full_version")
+                                    )
+                                    logging.info(
+                                        f"Using first available runtime for app {app_metadata.get('name')}"
+                                    )
+                        # Parse environment from JSON string to dict if needed for V2 API
+                        if "environment" in app_metadata and isinstance(
+                            app_metadata["environment"], str
+                        ):
+                            try:
+                                app_metadata["environment"] = json.loads(
+                                    app_metadata["environment"]
+                                )
+                            except json.JSONDecodeError:
+                                logging.warning(
+                                    f"Could not parse environment JSON for app {app_metadata.get('name', 'unknown')}, using empty dict"
+                                )
+                                app_metadata["environment"] = {}
+                        
+                        # Check runtime availability and decide import strategy
+                        app_name = app_metadata.get("name", "unknown")
+                        script_path = app_metadata.get("script", "")
+                        required_runtime = app_metadata.get("runtime_identifier")
+                        
+                        is_system_script = script_path and any(
+                            script_path.startswith(p) for p in ["/opt/", "/usr/", "/bin/", "/etc/"]
                         )
-                        self.stop_application_v2(proj_id=project_id, app_id=app_id)
-                        logging.info(
-                            "Application- %s has been migrated successfully",
-                            app_metadata["name"],
-                        )
+                        
+                        # Check if required runtime exists in target workspace
+                        runtime_available = False
+                        if required_runtime:
+                            available_runtime_ids = [r.get("image_identifier") for r in runtime_list.get("runtimes", [])]
+                            runtime_available = required_runtime in available_runtime_ids
+                            logging.info(
+                                f"Application '{app_name}' requires runtime: {required_runtime} "
+                                f"({'available' if runtime_available else 'NOT available'} in target)"
+                            )
+                        
+                        # Decision logic based on runtime availability and script type
+                        if not required_runtime or runtime_available:
+                            # Runtime available (or not specified), attempt import
+                            
+                            # Convert absolute system script paths to relative paths
+                            # (placeholder files are created at relative paths during export)
+                            converted_script = False
+                            original_script_path = script_path
+                            if script_path and script_path.startswith("/"):
+                                relative_script_path = script_path.lstrip("/")
+                                app_metadata["script"] = relative_script_path
+                                converted_script = True
+                                logging.info(
+                                    f"Converting system script path for '{app_name}': "
+                                    f"{original_script_path} → {relative_script_path}"
+                                )
+                            
+                            try:
+                                app_id = self.create_application_v2(
+                                    proj_id=project_id, app_metadata=app_metadata
+                                )
+                                self.stop_application_v2(proj_id=project_id, app_id=app_id)
+                                
+                                if converted_script:
+                                    logging.info(
+                                        f"✅ Application '{app_name}' imported with converted script path. "
+                                        f"Update in CML UI to: {original_script_path}"
+                                    )
+                                    # Track as needing manual update
+                                    if "apps_imported_with_modifications" not in self.import_tracking:
+                                        self.import_tracking["apps_imported_with_modifications"] = []
+                                    self.import_tracking["apps_imported_with_modifications"].append({
+                                        "name": app_name,
+                                        "runtime": required_runtime,
+                                        "original_script": original_script_path,
+                                        "current_script": app_metadata["script"],
+                                        "reason": "System script path converted to relative path for migration",
+                                        "action": f"Update application script in CML UI from '{app_metadata['script']}' back to '{original_script_path}'"
+                                    })
+                                else:
+                                    logging.info(f"✅ Application '{app_name}' imported successfully")
+                                    self.import_tracking["apps_imported_successfully"].append({
+                                        "name": app_name,
+                                        "runtime": required_runtime or "default",
+                                        "script": script_path
+                                    })
+                            except HTTPError as e:
+                                # Application creation failed
+                                logging.error(f"Failed to import application '{app_name}': {e}")
+                                error_message = str(e)
+                                if hasattr(e, 'response') and e.response is not None:
+                                    try:
+                                        error_json = e.response.json()
+                                        error_message = error_json.get("message") or error_json.get("error") or str(e)
+                                    except:
+                                        pass
+                                
+                                self.import_tracking["apps_removed_from_manifest"].append({
+                                    "name": app_name,
+                                    "runtime": required_runtime,
+                                    "script": script_path,
+                                    "reason": f"Failed to create application: {error_message}",
+                                    "action": "Check application configuration and manually recreate if needed"
+                                })
+                                continue
+                        
+                        else:
+                            # Runtime NOT available
+                            if is_system_script:
+                                # System script needs its specific runtime
+                                logging.warning(
+                                    f"⏭️  Skipped application '{app_name}': "
+                                    f"Required runtime not available"
+                                )
+                                self.import_tracking["apps_skipped"].append({
+                                    "name": app_name,
+                                    "runtime": required_runtime,
+                                    "script": script_path,
+                                    "reason": "Required runtime not available",
+                                    "action": "Install required runtime or manually recreate application"
+                                })
+                                continue
+                            else:
+                                # Project script, try with fallback runtime
+                                try:
+                                    app_metadata_fallback = app_metadata.copy()
+                                    # Use first available runtime as fallback
+                                    if runtime_list and "runtimes" in runtime_list and runtime_list["runtimes"]:
+                                        fallback_runtime = runtime_list["runtimes"][0].get("image_identifier")
+                                        app_metadata_fallback["runtime_identifier"] = fallback_runtime
+                                        
+                                        app_id = self.create_application_v2(
+                                            proj_id=project_id, app_metadata=app_metadata_fallback
+                                        )
+                                        self.stop_application_v2(proj_id=project_id, app_id=app_id)
+                                        logging.warning(
+                                            f"⚠️  Application '{app_name}' imported with fallback runtime. "
+                                            f"Please test functionality."
+                                        )
+                                        self.import_tracking["apps_imported_with_fallback"].append({
+                                            "name": app_name,
+                                            "required_runtime": required_runtime,
+                                            "fallback_runtime": fallback_runtime,
+                                            "script": script_path,
+                                            "action": "Test functionality, may need runtime installation"
+                                        })
+                                except HTTPError as e:
+                                    # Even fallback failed
+                                    logging.error(f"❌ Failed to import '{app_name}' even with fallback runtime")
+                                    self.import_tracking["apps_skipped"].append({
+                                        "name": app_name,
+                                        "runtime": required_runtime,
+                                        "script": script_path,
+                                        "reason": "Failed even with fallback runtime",
+                                        "action": "Manually recreate application"
+                                    })
+                                    continue
                     else:
                         logging.info(
                             "Skipping the already existing application %s with same subdomain- %s",
@@ -2106,13 +2963,22 @@ class ProjectImporter(BaseWorkspaceInteractor):
                 api_key=self.api_key,
                 ca_path=self.ca_path,
                 project_slug=self.project_slug,
-                skip_tls_verification=self.skip_tls_verification,
             )
+            
+            # Initialize job tracking
+            if "jobs_imported_successfully" not in self.import_tracking:
+                self.import_tracking["jobs_imported_successfully"] = []
+            if "jobs_created_with_fallback" not in self.import_tracking:
+                self.import_tracking["jobs_created_with_fallback"] = []
+            if "jobs_skipped" not in self.import_tracking:
+                self.import_tracking["jobs_skipped"] = []
+            
             job_metadata_list = read_json_file(job_metadata_filepath)
             src_tgt_job_mapping = {}
             # Create job in target CML workspace.
             if job_metadata_list != None:
                 for job_metadata in job_metadata_list:
+                    job_name = job_metadata.get("name", "unknown")
                     target_job_id = self.check_job_exist(
                         job_name=job_metadata["name"],
                         script=job_metadata["script"],
@@ -2121,6 +2987,37 @@ class ProjectImporter(BaseWorkspaceInteractor):
                     if target_job_id == None:
                         job_metadata["project_id"] = project_id
                         job_metadata["paused"] = True
+                        required_runtime = job_metadata.get("runtime_identifier", None)
+                        runtime_available = False
+                        used_fallback = False
+                        
+                        # Check if required runtime exists in target
+                        if required_runtime and proj_with_runtime:
+                            runtime_available = any(
+                                r.get("image_identifier") == required_runtime
+                                for r in runtime_list.get("runtimes", [])
+                            )
+                            
+                            if not runtime_available:
+                                logging.warning(
+                                    f"⚠️  Job '{job_name}' requires runtime '{required_runtime}' which is not available"
+                                )
+                                # Try to find fallback runtime
+                                if all(k in job_metadata for k in ["runtime_edition", "runtime_editor", "runtime_kernel"]):
+                                    fallback_runtime = get_best_runtime(
+                                        runtime_list["runtimes"],
+                                        job_metadata["runtime_edition"],
+                                        job_metadata["runtime_editor"],
+                                        job_metadata["runtime_kernel"],
+                                        job_metadata.get("runtime_shortversion", ""),
+                                        job_metadata.get("runtime_fullversion", ""),
+                                    )
+                                    if fallback_runtime:
+                                        logging.info(f"Using fallback runtime for job '{job_name}': {fallback_runtime}")
+                                        job_metadata["runtime_identifier"] = fallback_runtime
+                                        used_fallback = True
+                                        runtime_available = True
+                        
                         if spark_runtime_id != None:
                             job_metadata["runtime_addon_identifiers"] = [
                                 spark_runtime_id
@@ -2140,25 +3037,68 @@ class ProjectImporter(BaseWorkspaceInteractor):
                             if runtime_identifier != None:
                                 job_metadata["runtime_identifier"] = runtime_identifier
                             else:
-                                job_metadata[
-                                    "runtime_identifier"
-                                ] = legacy_engine_runtime_constants.engine_to_runtime_map().get(
-                                    "default"
-                                )
-                        target_job_id = self.create_job_v2(
-                            proj_id=project_id, job_metadata=job_metadata
-                        )
-                        logging.info(
-                            "Job- %s has been migrated successfully",
-                            job_metadata["name"],
-                        )
+                                # Try first available runtime
+                                if runtime_list.get("runtimes"):
+                                    first_runtime = runtime_list["runtimes"][0].get("image_identifier")
+                                    if first_runtime:
+                                        logging.info(f"Using first available runtime for job '{job_name}': {first_runtime}")
+                                        job_metadata["runtime_identifier"] = first_runtime
+                                        used_fallback = True
+                        
+                        # Fix environment field - API expects JSON object, not string
+                        if "environment" in job_metadata and isinstance(job_metadata["environment"], str):
+                            try:
+                                job_metadata["environment"] = json.loads(job_metadata["environment"])
+                            except json.JSONDecodeError:
+                                logging.warning(f"Could not parse environment for job {job_metadata['name']}, setting to empty dict")
+                                job_metadata["environment"] = {}
+                        
+                        try:
+                            target_job_id = self.create_job_v2(
+                                proj_id=project_id, job_metadata=job_metadata
+                            )
+                            
+                            if used_fallback:
+                                logging.info(f"✅ Job '{job_name}' created with fallback runtime")
+                                self.import_tracking["jobs_created_with_fallback"].append({
+                                    "name": job_name,
+                                    "required_runtime": required_runtime,
+                                    "fallback_runtime": job_metadata.get("runtime_identifier"),
+                                    "action": "Verify job functionality with the fallback runtime"
+                                })
+                            else:
+                                logging.info(f"✅ Job '{job_name}' migrated successfully")
+                                self.import_tracking["jobs_imported_successfully"].append({
+                                    "name": job_name,
+                                    "runtime": job_metadata.get("runtime_identifier", "default")
+                                })
+                        
+                        except HTTPError as e:
+                            error_message = str(e)
+                            if hasattr(e, 'response') and e.response is not None:
+                                try:
+                                    error_json = e.response.json()
+                                    error_message = error_json.get("message") or error_json.get("error") or str(e)
+                                except:
+                                    pass
+                            
+                            logging.error(f"Failed to create job '{job_name}': {error_message}")
+                            self.import_tracking["jobs_skipped"].append({
+                                "name": job_name,
+                                "runtime": required_runtime or "unknown",
+                                "reason": f"Job creation failed: {error_message}",
+                                "action": "Manually recreate the job in CML UI"
+                            })
+                            target_job_id = None
+                            continue
                     else:
                         logging.info(
                             "Skipping the already existing job- %s",
                             job_metadata["name"],
                         )
 
-                    src_tgt_job_mapping[job_metadata["source_jobid"]] = target_job_id
+                    if target_job_id:
+                        src_tgt_job_mapping[job_metadata["source_jobid"]] = target_job_id
 
                 # Update job dependency
                 for job_metadata in job_metadata_list:
@@ -2182,8 +3122,10 @@ class ProjectImporter(BaseWorkspaceInteractor):
         except Exception as e:
             logging.error("Job migration failed")
             logging.error(f"Error: {e}")
-            raise
-
+            # Don't raise - log the error and continue
+            logging.info("Continuing despite job errors...")
+            return
+        
     def get_project_infov2(self, proj_id: str):
         endpoint = Template(ApiV2Endpoints.GET_PROJECT.value).substitute(
             project_id=proj_id
@@ -2194,7 +3136,6 @@ class ProjectImporter(BaseWorkspaceInteractor):
             method="GET",
             user_token=self.apiv2_key,
             ca_path=self.ca_path,
-            skip_tls_verification=self.skip_tls_verification,
         )
         return response.json()
 

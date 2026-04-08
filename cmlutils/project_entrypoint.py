@@ -261,7 +261,7 @@ def project_export_cmd(project_name, verbose):
     is_flag=True,
     help="Enable verbose logging including API call details",
 )
-def project_import_cmd(project_name, verify):
+def project_import_cmd(project_name, verify, verbose):
     pimport = None
     import_diff_file_list = None
     config = _read_config_file(
@@ -271,23 +271,27 @@ def project_import_cmd(project_name, verify):
     username = config[USERNAME_KEY]
     url = config[URL_KEY]
     apiv1_key = config[API_V1_KEY]
-    local_directory = config[OUTPUT_DIR_KEY]
+    apiv2_key = config[API_V2_KEY]
+    source_directory = config[SOURCE_DIR_KEY]
+    output_directory = config[OUTPUT_DIR_KEY]
     ca_path = config[CA_PATH_KEY]
-    skip_tls_verification = config[constants.SKIP_TLS_VERIFICATION_KEY]
-    local_directory = get_absolute_path(local_directory)
+    source_directory = get_absolute_path(source_directory)
+    output_directory = get_absolute_path(output_directory)
     ca_path = get_absolute_path(ca_path)
-    log_filedir = os.path.join(local_directory, project_name, "logs")
+    log_filedir = os.path.join(output_directory, project_name, "logs")
 
-    _configure_project_command_logging(log_filedir, project_name)
+    _configure_project_command_logging(log_filedir, project_name, verbose)
+    if verbose:
+        logging.debug("Verbose mode enabled - additional API call details will be logged")
     p = ProjectImporter(
         host=url,
         username=username,
         project_name=project_name,
         api_key=apiv1_key,
-        top_level_dir=local_directory,
+        top_level_dir=source_directory,
         ca_path=ca_path,
         project_slug=project_name,
-        skip_tls_verification=skip_tls_verification,
+        apiv2_key=apiv2_key,
     )
     logging.info("Started importing project: %s", project_name)
     try:
@@ -295,10 +299,9 @@ def project_import_cmd(project_name, verify):
             host=url,
             username=username,
             project_name=project_name,
-            top_level_directory=local_directory,
+            top_level_directory=source_directory,
             apiv1_key=apiv1_key,
             ca_path=ca_path,
-            skip_tls_verification=skip_tls_verification,
         )
         logging.info("Begin validating for import.")
         for v in validators:
@@ -316,7 +319,7 @@ def project_import_cmd(project_name, verify):
             "Finished validating import validations for project %s.", project_name
         )
         project_filepath = get_project_metadata_file_path(
-            top_level_dir=local_directory, project_name=project_name
+            top_level_dir=source_directory, project_name=project_name
         )
         project_metadata = read_json_file(project_filepath)
 
@@ -343,10 +346,10 @@ def project_import_cmd(project_name, verify):
             username=username,
             project_name=project_name,
             api_key=apiv1_key,
-            top_level_dir=local_directory,
+            top_level_dir=source_directory,
             ca_path=ca_path,
             project_slug=project_slug,
-            skip_tls_verification=skip_tls_verification,
+            apiv2_key=apiv2_key,
         )
         start_time = time.time()
         if verify:
@@ -364,21 +367,7 @@ def project_import_cmd(project_name, verify):
         import_data["project_name"] = project_name
         import_data = pimport.import_metadata(project_id=project_id)
         
-        # Transfer ownership to original owner if specified in metadata
-        if "original_owner_username" in project_metadata and project_metadata["original_owner_username"]:
-            original_owner = project_metadata["original_owner_username"]
-            if original_owner != username:
-                logging.info("Attempting to transfer ownership to original owner: %s", original_owner)
-                try:
-                    pimport.trasnfer_ownership_to_original_owner(original_owner_username=original_owner)
-                except Exception as e:
-                    logging.warning(
-                        "Ownership transfer to %s failed but continuing with import. Error: %s",
-                        original_owner,
-                        str(e)
-                    )
-        
-        print("\033[32m✔ Import of Project {} Successful \033[0m".format(project_name))
+        print("\033[32mSUCCESS✔ Import of Project {} Successful \033[0m".format(project_name))
         print(
             "\033[34m\tImported {} Jobs {}\033[0m".format(
                 import_data.get("total_job"), import_data.get("job_name_list")
@@ -426,9 +415,9 @@ def project_import_cmd(project_name, verify):
             )
 
             export_username = config[USERNAME_KEY]
-            export_project_owner_username = config[PROJECT_OWNER_USERNAME_KEY]
             export_url = config[URL_KEY]
             export_apiv1_key = config[API_V1_KEY]
+            export_apiv2_key = config[API_V2_KEY]
             output_dir = config[OUTPUT_DIR_KEY]
             ca_path = config[CA_PATH_KEY]
 
@@ -436,7 +425,7 @@ def project_import_cmd(project_name, verify):
             export_ca_path = get_absolute_path(ca_path)
 
             log_filedir = os.path.join(output_dir, project_name, "logs")
-            _configure_project_command_logging(log_filedir, project_name)
+            _configure_project_command_logging(log_filedir, project_name, verbose)
 
             import_file = log_filedir + constants.IMPORT_METRIC_FILE
             with open(import_file, 'r') as file:
@@ -445,13 +434,13 @@ def project_import_cmd(project_name, verify):
                 pobj = ProjectExporter(
                     host=export_url,
                     username=export_username,
-                    project_owner_username=export_project_owner_username,
                     project_name=project_name,
                     api_key=export_apiv1_key,
                     top_level_dir=export_output_dir,
                     ca_path=export_ca_path,
                     project_slug=project_name,
                     owner_type="",
+                    apiv2_key=export_apiv2_key,
                 )
                 (
                     export_creator_username,
@@ -468,7 +457,7 @@ def project_import_cmd(project_name, verify):
                 logging.info("Begin validating export project")
                 validators = initialize_export_validators(
                     host=export_url,
-                    username=export_project_owner_username,
+                    username=export_creator_username,
                     project_name=project_name,
                     top_level_directory=export_output_dir,
                     apiv1_key=export_apiv1_key,
@@ -493,13 +482,13 @@ def project_import_cmd(project_name, verify):
                 pexport = ProjectExporter(
                     host=export_url,
                     username=export_username,
-                    project_owner_username=export_project_owner_username,
                     project_name=project_name,
                     api_key=export_apiv1_key,
                     top_level_dir=export_output_dir,
                     ca_path=export_ca_path,
                     project_slug=export_project_slug,
                     owner_type=export_owner_type,
+                    apiv2_key=export_apiv2_key,
                 )
                 (
                     exported_proj_data,

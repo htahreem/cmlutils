@@ -23,11 +23,11 @@ def _get_cdswctl_download_url(host: str) -> str:
     return final_url
 
 
-def _download_and_extract(url: str, ca_path: str, skip_tls_verification: bool = False):
+def _download_and_extract(url: str, ca_path: str):
     file_name = url.split("/")[-1]
     dir_path = _cdswctl_tmp_dir_path()
     file_path = os.path.join(dir_path, file_name)
-    download_file(url=url, filepath=file_path, ca_path=ca_path, skip_tls_verification=skip_tls_verification)
+    download_file(url=url, filepath=file_path, ca_path=ca_path)
     if Path(constants.BASE_PATH_CDSWCTL) in Path(dir_path).parents:
         tf = tarfile.open(file_path)
         tf.extractall(dir_path)
