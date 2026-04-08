@@ -674,7 +674,7 @@ def project_import_cmd(project_name, verify, verbose):
     is_flag=True,
     help="Enable verbose logging including API call details",
 )
-def project_verify_cmd(project_name):
+def project_verify_cmd(project_name, verbose):
     pexport = None
     validation_data = dict()
     config = _read_config_file(
@@ -682,9 +682,9 @@ def project_verify_cmd(project_name):
     )
 
     export_username = config[USERNAME_KEY]
-    export_project_owner_username = config[PROJECT_OWNER_USERNAME_KEY]
     export_url = config[URL_KEY]
     export_apiv1_key = config[API_V1_KEY]
+    export_apiv2_key = config[API_V2_KEY]
     output_dir = config[OUTPUT_DIR_KEY]
     ca_path = config[CA_PATH_KEY]
 
@@ -692,7 +692,9 @@ def project_verify_cmd(project_name):
     export_ca_path = get_absolute_path(ca_path)
 
     log_filedir = os.path.join(output_dir, project_name, "logs")
-    _configure_project_command_logging(log_filedir, project_name)
+    _configure_project_command_logging(log_filedir, project_name, verbose)
+    if verbose:
+        logging.debug("Verbose mode enabled - additional API call details will be logged")
     logging.info("Started Verifying project: %s", project_name)
     import_file = log_filedir + constants.IMPORT_METRIC_FILE
     try:
@@ -705,13 +707,13 @@ def project_verify_cmd(project_name):
         pobj = ProjectExporter(
             host=export_url,
             username=export_username,
-            project_owner_username=export_project_owner_username,
             project_name=project_name,
             api_key=export_apiv1_key,
             top_level_dir=export_output_dir,
             ca_path=export_ca_path,
             project_slug=project_name,
             owner_type="",
+            apiv2_key=export_apiv2_key,
         )
         (
             export_creator_username,
@@ -728,7 +730,7 @@ def project_verify_cmd(project_name):
         logging.info("Begin validating export project")
         validators = initialize_export_validators(
             host=export_url,
-            username=export_project_owner_username,
+            username=export_creator_username,
             project_name=project_name,
             top_level_directory=export_output_dir,
             apiv1_key=export_apiv1_key,
@@ -753,13 +755,13 @@ def project_verify_cmd(project_name):
         pexport = ProjectExporter(
             host=export_url,
             username=export_username,
-            project_owner_username=export_project_owner_username,
             project_name=project_name,
             api_key=export_apiv1_key,
             top_level_dir=export_output_dir,
             ca_path=export_ca_path,
             project_slug=export_project_slug,
             owner_type=export_owner_type,
+            apiv2_key=export_apiv2_key,
         )
         (
             exported_proj_data,
@@ -780,6 +782,7 @@ def project_verify_cmd(project_name):
         import_username = import_config[USERNAME_KEY]
         import_url = import_config[URL_KEY]
         import_apiv1_key = import_config[API_V1_KEY]
+        import_apiv2_key = import_config[API_V2_KEY]
         local_directory = import_config[OUTPUT_DIR_KEY]
         ca_path = import_config[CA_PATH_KEY]
         import_local_directory = get_absolute_path(local_directory)
@@ -792,6 +795,7 @@ def project_verify_cmd(project_name):
             top_level_dir=import_local_directory,
             ca_path=import_ca_path,
             project_slug=project_name,
+            apiv2_key=import_apiv2_key,
         )
         logging.info("Started Verifying imported project: %s", project_name)
         try:
@@ -829,8 +833,9 @@ def project_verify_cmd(project_name):
             )
             project_metadata = read_json_file(project_filepath)
 
-            if "team_name" in project_metadata:
-                import_username = project_metadata["team_name"]
+            # Don't override username with team_name - use API key owner's username for owner change logic
+            #if "team_name" in project_metadata:
+            #    import_username = project_metadata["team_name"]
             import_creator_username, import_project_slug = p.get_creator_username()
             pimport = ProjectImporter(
                 host=import_url,
@@ -840,6 +845,7 @@ def project_verify_cmd(project_name):
                 top_level_dir=import_local_directory,
                 ca_path=import_ca_path,
                 project_slug=import_project_slug,
+                apiv2_key=import_apiv2_key,
             )
 
             (

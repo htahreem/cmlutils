@@ -312,7 +312,6 @@ def verify_files(
     project_name: str,
     log_filedir: str,
     exclude_file_path: str = None,
-    importignore_path: str = None,
 ):
     log_filename = log_filedir + constants.LOG_FILE
     logging.info("Validating files over ssh from sshport %s", sshport)
@@ -331,11 +330,6 @@ def verify_files(
         "--log-file",
         log_filename,
     ]
-    
-    # Add importignore exclusions if provided
-    if importignore_path is not None and os.path.exists(importignore_path):
-        logging.info("Using .importignore file for exclusions: %s", importignore_path)
-        subprocess_arguments.append(f"--exclude-from={importignore_path}")
     
     if exclude_file_path is not None:
         logging.info("Exclude file path is provided for file Verification")
@@ -913,22 +907,22 @@ class ProjectExporter(BaseWorkspaceInteractor):
         rsync_enabled_runtime_id = -1
         if is_project_configured_with_runtimes(
             host=self.host,
-            username=self.project_owner_username,
+            username=self.username,
             project_name=self.project_name,
             api_key=self.api_key,
             ca_path=self.ca_path,
             project_slug=self.project_slug,
-            skip_tls_verification=self.skip_tls_verification,
         ):
             rsync_enabled_runtime_id = get_rsync_enabled_runtime_id(
-                host=self.host, api_key=self.api_key, ca_path=self.ca_path, skip_tls_verification=self.skip_tls_verification
+                host=self.host, api_key=self.api_key, ca_path=self.ca_path
             )
-        cdswctl_path = obtain_cdswctl(host=self.host, ca_path=self.ca_path, skip_tls_verification=self.skip_tls_verification)
+        cdswctl_path = obtain_cdswctl(host=self.host, ca_path=self.ca_path)
         login_response = cdswctl_login(
             cdswctl_path=cdswctl_path,
             host=self.host,
             username=self.username,
             api_key=self.api_key,
+            ca_path=self.ca_path,
         )
         if login_response.returncode != 0:
             logging.error("Cdswctl login failed")
@@ -965,7 +959,6 @@ class ProjectExporter(BaseWorkspaceInteractor):
             project_name=self.project_name,
             exclude_file_path=exclude_file_path,
             log_filedir=log_filedir,
-            importignore_path=None,
         )
         self.remove_cdswctl_dir(cdswctl_path)
         self.terminate_ssh_session()
@@ -1192,8 +1185,9 @@ print("Please update the application script path in CML UI")
         # Create placeholder files for system scripts to enable migration
         self._create_placeholder_files_for_system_scripts(app_metadata_list)
 
-    def collect_export_job_list(self):
-        job_list = self.get_jobs_listv1()
+    def collect_export_job_list(self, project_id):
+        # Use V2 API to get jobs list
+        job_list = self.get_jobs_listv2(project_id=project_id)
         job_name_list = []
         if len(job_list) == 0:
             logging.info("Jobs are not present in the project %s.", self.project_name)
@@ -1208,7 +1202,8 @@ print("Please update the application script path in CML UI")
         return job_metadata_list, sorted(job_name_list)
 
     def collect_export_model_list(self, proj_id):
-        model_list = self.get_models_listv1(proj_id)
+        # Use V2 API to get models list
+        model_list = self.get_models_listv2(project_id=proj_id)
         model_name_list = []
         if len(model_list) == 0:
             logging.info("Models are not present in the project %s.", self.project_name)
@@ -1216,14 +1211,17 @@ print("Please update the application script path in CML UI")
             logging.info("Project {} has {} Models".format(self.project_name, len(model_list)))
         model_metadata_list = []
         for model in model_list:
-            model_info_flatten = flatten_json_data(model)
-            model_metadata = extract_fields(model_info_flatten, constants.MODEL_MAP)
+            model_metadata = {
+                "name": model.get("name", ""),
+                "description": model.get("description", "")
+            }
             model_name_list.append(model_metadata["name"])
             model_metadata_list.append(model_metadata)
         return model_metadata_list, sorted(model_name_list)
 
-    def collect_export_application_list(self):
-        app_list = self.get_app_listv1()
+    def collect_export_application_list(self, project_id):
+        # Use V2 API to get applications list
+        app_list = self.get_app_listv2(project_id=project_id)
         app_name_list = []
         if len(app_list) == 0:
             logging.info(
@@ -1234,7 +1232,7 @@ print("Please update the application script path in CML UI")
         app_metadata_list = []
         for app in app_list:
             app_info_flatten = flatten_json_data(app)
-            app_metadata = extract_fields(app_info_flatten, constants.APPLICATION_MAP)
+            app_metadata = extract_fields(app_info_flatten, constants.APPLICATION_MAPV2)
             app_name_list.append(app_metadata["name"])
             project_env = self.get_project_env()
             if not app_metadata.get("environment"):
@@ -1348,18 +1346,19 @@ print("Please update the application script path in CML UI")
                     # Don't fail the export, but log the error
 
     def collect_export_project_data(self):
-        proj_data_raw = self.get_project_infov1()
+        # Use V2 API to get project info
+        proj_data_raw = self.get_project_infov2()
         proj_info_flatten = flatten_json_data(proj_data_raw)
-        proj_data = [extract_fields(proj_info_flatten, constants.PROJECT_MAP)]
+        proj_data = [extract_fields(proj_info_flatten, constants.PROJECT_MAPV2)]
         proj_list = [self.project_name.lower()]
         if not proj_data[0].get("shared_memory_limit"):
             proj_data[0]["shared_memory_limit"] = 0
 
         model_data, model_list = self.collect_export_model_list(
-            int(proj_data_raw["id"])
+            proj_data_raw["id"]
         )
-        app_data, app_list = self.collect_export_application_list()
-        job_data, job_list = self.collect_export_job_list()
+        app_data, app_list = self.collect_export_application_list(proj_data_raw["id"])
+        job_data, job_list = self.collect_export_job_list(proj_data_raw["id"])
         return (
             proj_data,
             proj_list,
@@ -1663,9 +1662,9 @@ class ProjectImporter(BaseWorkspaceInteractor):
 
     def verify_project(self, log_filedir: str):
         rsync_enabled_runtime_id = get_rsync_enabled_runtime_id(
-            host=self.host, api_key=self.apiv2_key, ca_path=self.ca_path, skip_tls_verification=self.skip_tls_verification
+            host=self.host, api_key=self.apiv2_key, ca_path=self.ca_path
         )
-        cdswctl_path = obtain_cdswctl(host=self.host, ca_path=self.ca_path, skip_tls_verification=self.skip_tls_verification)
+        cdswctl_path = obtain_cdswctl(host=self.host, ca_path=self.ca_path)
         login_response = cdswctl_login(
             cdswctl_path=cdswctl_path,
             host=self.host,
@@ -2047,7 +2046,6 @@ class ProjectImporter(BaseWorkspaceInteractor):
             method="GET",
             user_token=self.apiv2_key,
             ca_path=self.ca_path,
-            skip_tls_verification=self.skip_tls_verification,
         )
         return response.json()
 
