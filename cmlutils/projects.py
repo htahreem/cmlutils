@@ -1670,6 +1670,7 @@ class ProjectImporter(BaseWorkspaceInteractor):
             host=self.host,
             username=self.username,
             api_key=self.api_key,
+            ca_path=self.ca_path,
         )
         if login_response.returncode != 0:
             logging.error("Cdswctl login failed")
@@ -1681,13 +1682,6 @@ class ProjectImporter(BaseWorkspaceInteractor):
             project_slug=self.project_slug,
         )
         self._ssh_subprocess = ssh_subprocess
-        
-        # Use importignore file if it exists
-        importignore_path = os.path.join(
-            self.top_level_dir, self.project_name, "project-data", constants.IMPORTIGNORE_FILE_NAME
-        )
-        if not os.path.exists(importignore_path):
-            importignore_path = None
         
         result = verify_files(
             sshport=port,
@@ -1701,7 +1695,6 @@ class ProjectImporter(BaseWorkspaceInteractor):
             retry_limit=3,
             project_name=self.project_name,
             log_filedir=log_filedir,
-            importignore_path=importignore_path,
         )
         self.remove_cdswctl_dir(cdswctl_path)
         return result
