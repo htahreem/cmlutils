@@ -19,6 +19,7 @@ def call_api_v1(
     api_key: str,
     json_data: dict = None,
     ca_path: str = "",
+    skip_tls_verification: bool = False,
 ) -> requests.Response:
     import time
 
@@ -43,6 +44,14 @@ def call_api_v1(
     headers = {"Content-Type": "application/json"}
     resp = None
 
+    # Determine SSL verification setting
+    if skip_tls_verification:
+        verify_setting = False
+    elif ca_path != "":
+        verify_setting = ca_path
+    else:
+        verify_setting = True
+
     start_time = time.time()
     
     try:
@@ -53,7 +62,7 @@ def call_api_v1(
                 auth=(api_key, ""),
                 headers=headers,
                 json=json_data,
-                verify=False if ca_path.lower() == "false" else (ca_path if ca_path != "" else True),
+                verify=verify_setting,
             )
         else:
             resp = s.request(
@@ -61,7 +70,7 @@ def call_api_v1(
                 url=url,
                 auth=(api_key, ""),
                 headers=headers,
-                verify=False if ca_path.lower() == "false" else (ca_path if ca_path != "" else True),
+                verify=verify_setting,
             )
 
         elapsed_time = time.time() - start_time
@@ -99,6 +108,7 @@ def call_api_v2(
     user_token: str,
     json_data: dict = None,
     ca_path: str = "",
+    skip_tls_verification: bool = False,
 ) -> requests.Response:
     import time
 
@@ -125,6 +135,16 @@ def call_api_v2(
         "Authorization": "Bearer {}".format(user_token),
     }
     resp = None
+
+    # Determine SSL verification setting
+    if skip_tls_verification:
+        verify_setting = False
+    elif ca_path != "":
+        verify_setting = ca_path
+    else:
+        verify_setting = True
+
+    logging.debug("Using verify=%s (type=%s)", verify_setting, type(verify_setting))
     
     start_time = time.time()
     try:
@@ -134,14 +154,14 @@ def call_api_v2(
                 url=url,
                 headers=headers,
                 json=json_data,
-                verify=False if ca_path.lower() == "false" else (ca_path if ca_path != "" else True),
+                verify=verify_setting,
             )
         else:
             resp = s.request(
                 method=method.upper(),
                 url=url,
                 headers=headers,
-                verify=False if ca_path.lower() == "false" else (ca_path if ca_path != "" else True),
+                verify=verify_setting,
             )
 
         elapsed_time = time.time() - start_time

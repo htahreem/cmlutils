@@ -127,7 +127,7 @@ class UserNameImportValidator(ImportValidators):
 
 class RsyncRuntimeAddonExistsImportValidator(ImportValidators):
     def __init__(
-        self, host: str, username: str, apiv1_key: str, project_name: str, ca_path: str
+        self, host: str, username: str, apiv1_key: str, project_name: str, ca_path: str, skip_tls_verification: bool = False
     ):
         self.validation_name = "check if rsync is present"
         self.host = host
@@ -135,6 +135,7 @@ class RsyncRuntimeAddonExistsImportValidator(ImportValidators):
         self.apiv1_key = apiv1_key
         self.project_name = project_name
         self.ca_path = ca_path
+        self.skip_tls_verification = skip_tls_verification
 
     def validate(self) -> ValidationResponse:
         # Skip validation if no V1 API key (rsync check requires V1 API)
@@ -148,7 +149,7 @@ class RsyncRuntimeAddonExistsImportValidator(ImportValidators):
         
         rsync_enabled_runtime_id = -1
         rsync_enabled_runtime_id = get_rsync_enabled_runtime_id(
-            host=self.host, api_key=self.apiv1_key, ca_path=self.ca_path
+            host=self.host, api_key=self.apiv1_key, ca_path=self.ca_path, skip_tls_verification=self.skip_tls_verification
         )
         if rsync_enabled_runtime_id != -1:
             return ValidationResponse(
@@ -260,7 +261,7 @@ class ProjectBelongsToUserValidator(ExportValidators):
             import urllib.parse
             
             endpoint_api_key = Template(ApiV1Endpoints.API_KEY.value).substitute(
-                username=self.username
+                owner=self.username, project_name=self.project_slug
             )
             json_data = {
                 "expiryDate": (datetime.now() + timedelta(weeks=1)).strftime(
@@ -274,6 +275,7 @@ class ProjectBelongsToUserValidator(ExportValidators):
                 api_key=self.apiv1_key,
                 json_data=json_data,
                 ca_path=self.ca_path,
+                skip_tls_verification=self.skip_tls_verification,
             )
             apiv2_key = response_key.json()["apiKey"]
             
@@ -289,6 +291,7 @@ class ProjectBelongsToUserValidator(ExportValidators):
                 method="GET",
                 user_token=apiv2_key,
                 ca_path=self.ca_path,
+                skip_tls_verification=self.skip_tls_verification,
             )
             project_list = response.json()["projects"]
             
@@ -378,9 +381,10 @@ class RsyncRuntimeAddonExistsExportValidator(ExportValidators):
             api_key=self.apiv1_key,
             ca_path=self.ca_path,
             project_slug=self.project_slug,
+            skip_tls_verification=self.skip_tls_verification,
         ):
             rsync_enabled_runtime_id = get_rsync_enabled_runtime_id(
-                host=self.host, api_key=self.apiv1_key, ca_path=self.ca_path
+                host=self.host, api_key=self.apiv1_key, ca_path=self.ca_path, skip_tls_verification=self.skip_tls_verification
             )
             if rsync_enabled_runtime_id != -1:
                 return ValidationResponse(
@@ -412,6 +416,7 @@ def initialize_import_validators(
     top_level_directory: str,
     apiv1_key: str,
     ca_path: str,
+    skip_tls_verification: bool = False,
 ) -> List[ImportValidators]:
     return [
         DirectoriesAndFilesValidator(
@@ -427,6 +432,7 @@ def initialize_import_validators(
             apiv1_key=apiv1_key,
             project_name=project_name,
             ca_path=ca_path,
+            skip_tls_verification=skip_tls_verification,
         ),
     ]
 
@@ -439,6 +445,7 @@ def initialize_export_validators(
     apiv1_key: str,
     ca_path: str,
     project_slug: str,
+    skip_tls_verification: bool = False,
 ) -> List[ExportValidators]:
     return [
         TopLevelDirectoryValidator(top_level_directory=top_level_directory),
@@ -451,6 +458,7 @@ def initialize_export_validators(
             project_name=project_name,
             ca_path=ca_path,
             project_slug=project_slug,
+            skip_tls_verification=skip_tls_verification,
         ),
         RsyncRuntimeAddonExistsExportValidator(
             host=host,
@@ -459,5 +467,6 @@ def initialize_export_validators(
             project_name=project_name,
             ca_path=ca_path,
             project_slug=project_slug,
+            skip_tls_verification=skip_tls_verification,
         ),
     ]

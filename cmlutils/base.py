@@ -18,6 +18,7 @@ class BaseWorkspaceInteractor(object):
         ca_path: str,
         project_slug: str,
         apiv2_key: str = None,
+        skip_tls_verification: bool = False,
     ) -> None:
         self.host = host
         self.username = username
@@ -26,6 +27,7 @@ class BaseWorkspaceInteractor(object):
         self.ca_path = ca_path
         self.project_slug = project_slug
         self._apiv2_key = apiv2_key  # V2 API key (may be None)
+        self.skip_tls_verification = skip_tls_verification
 
     @property
     def apiv2_key(self) -> str:
@@ -36,7 +38,7 @@ class BaseWorkspaceInteractor(object):
         # If we only have V1 key, generate V2 key from it (legacy behavior)
         if self.api_key:
             endpoint = Template(ApiV1Endpoints.API_KEY.value).substitute(
-                username=self.username
+                owner=self.username
             )
             json_data = {
                 "expiryDate": (datetime.now() + timedelta(weeks=1)).strftime(
@@ -50,6 +52,7 @@ class BaseWorkspaceInteractor(object):
                 api_key=self.api_key,
                 json_data=json_data,
                 ca_path=self.ca_path,
+                skip_tls_verification=self.skip_tls_verification,
             )
             response_dict = response.json()
             _apiv2_key = response_dict["apiKey"]

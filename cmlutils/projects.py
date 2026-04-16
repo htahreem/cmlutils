@@ -45,10 +45,11 @@ def is_project_configured_with_runtimes(
     api_key: str,
     ca_path: str,
     project_slug: str,
+    skip_tls_verification: bool = False,
 ) -> bool:
     # Use V2 API - first get V2 token
     endpoint_api_key = Template(ApiV1Endpoints.API_KEY.value).substitute(
-        username=username
+        owner=username, project_name=project_slug
     )
     json_data = {
         "expiryDate": (datetime.now() + timedelta(weeks=1)).strftime(
@@ -62,6 +63,7 @@ def is_project_configured_with_runtimes(
         api_key=api_key,
         json_data=json_data,
         ca_path=ca_path,
+        skip_tls_verification=skip_tls_verification,
     )
     apiv2_key = response_key.json()["apiKey"]
     
@@ -94,9 +96,10 @@ def get_ignore_files(
     ssh_port: str,
     project_slug: str,
     top_level_dir: str,
+    skip_tls_verification: bool = False,
 ) -> str:
     endpoint = Template(ApiV1Endpoints.PROJECT_FILE.value).substitute(
-        username=username, project_name=project_slug, filename=constants.FILE_NAME
+        owner=username, project_name=project_slug, filename=constants.FILE_NAME
     )
     try:
         logging.info(
@@ -110,6 +113,7 @@ def get_ignore_files(
             method="GET", 
             api_key=api_key, 
             ca_path=ca_path,
+            skip_tls_verification=skip_tls_verification,
         )
         a = response.text + "\n" + constants.FILE_NAME
         with open(
@@ -201,9 +205,9 @@ def parse_rsync_errors_from_output(stderr_output: str) -> list:
     return error_lines
 
 
-def get_rsync_enabled_runtime_id(host: str, api_key: str, ca_path: str) -> int:
+def get_rsync_enabled_runtime_id(host: str, api_key: str, ca_path: str, skip_tls_verification: bool = False) -> int:
     logging.info("Looking for rsync-enabled runtime...")
-    runtime_list = get_cdsw_runtimes(host=host, api_key=api_key, ca_path=ca_path)
+    runtime_list = get_cdsw_runtimes(host=host, api_key=api_key, ca_path=ca_path, skip_tls_verification=skip_tls_verification)
     logging.info(f"Found {len(runtime_list)} runtimes")
     
     for runtime in runtime_list:
@@ -231,7 +235,7 @@ def get_rsync_enabled_runtime_id(host: str, api_key: str, ca_path: str) -> int:
     return -1
 
 
-def get_cdsw_runtimes(host: str, api_key: str, ca_path: str) -> list[dict[str, Any]]:
+def get_cdsw_runtimes(host: str, api_key: str, ca_path: str, skip_tls_verification: bool = False) -> list[dict[str, Any]]:
     endpoint = "api/v1/runtimes"
     response = call_api_v1(
         host=host, 
@@ -239,6 +243,7 @@ def get_cdsw_runtimes(host: str, api_key: str, ca_path: str) -> list[dict[str, A
         method="GET", 
         api_key=api_key, 
         ca_path=ca_path,
+        skip_tls_verification=skip_tls_verification,
     )
     response_dict = response.json()
     return response_dict["runtimes"]
@@ -388,20 +393,23 @@ class ProjectExporter(BaseWorkspaceInteractor):
         self,
         host: str,
         username: str,
+        project_owner_username: str,
         project_name: str,
         api_key: str,
         top_level_dir: str,
         ca_path: str,
         project_slug: str,
         owner_type: str,
+        skip_tls_verification: bool = False,
         apiv2_key: str = None,
     ) -> None:
         self._ssh_subprocess = None
         self.top_level_dir = top_level_dir
         self.project_id = None
+        self.project_owner_username = project_owner_username
         self.owner_type = owner_type
         self._original_owner_username = None  # Cache for owner restoration
-        super().__init__(host, username, project_name, api_key, ca_path, project_slug, apiv2_key)
+        super().__init__(host, username, project_name, api_key, ca_path, project_slug, apiv2_key, skip_tls_verification)
         self.metrics_data = dict()
 
     # Get CDSW project info using API v2
@@ -515,7 +523,7 @@ class ProjectExporter(BaseWorkspaceInteractor):
     # Get CDSW project env variables using API v1
     def get_project_env(self):
         endpoint = Template(ApiV1Endpoints.PROJECT_ENV.value).substitute(
-            username=self.username, project_name=self.project_slug
+            owner=self.project_owner_username, project_name=self.project_slug
         )
         response = call_api_v1(
             host=self.host,
@@ -523,49 +531,101 @@ class ProjectExporter(BaseWorkspaceInteractor):
             method="GET",
             api_key=self.api_key,
             ca_path=self.ca_path,
+            skip_tls_verification=self.skip_tls_verification,
         )
         return response.json()
 
     def get_creator_username(self):
-        # Use V2 API to search for the project
-        search_option = {"name": self.project_name}
-        encoded_option = urllib.parse.quote(
-            json.dumps(search_option).replace('"', '"')
-        )
-        endpoint = Template(ApiV2Endpoints.SEARCH_PROJECT.value).substitute(
-            search_option=encoded_option
-        )
-        response = call_api_v2(
-            host=self.host,
-            endpoint=endpoint,
-            method="GET",
-            user_token=self.apiv2_key,
-            ca_path=self.ca_path,
-        )
-        project_list = response.json()["projects"]
+        try:
+            # Use V2 API to search for the project
+            search_option = {"name": self.project_name}
+            encoded_option = urllib.parse.quote(
+                json.dumps(search_option).replace('"', '"')
+            )
+            endpoint = Template(ApiV2Endpoints.SEARCH_PROJECT.value).substitute(
+                search_option=encoded_option
+            )
+            response = call_api_v2(
+                host=self.host,
+                endpoint=endpoint,
+                method="GET",
+                user_token=self.apiv2_key,
+                ca_path=self.ca_path,
+                skip_tls_verification=self.skip_tls_verification,
+            )
+            project_list = response.json()["projects"]
         
+            if project_list:
+                for project in project_list:
+                    if project["name"] == self.project_name:
+                        # V2 API structure
+                        owner_info = project.get("owner", {})
+                        creator_info = project.get("creator", {})
+                    
+                        # V2 API uses project name as slug (V1 had slug_raw field but V2 doesn't)
+                        project_slug = project.get("slug") or project.get("slug_raw") or self.project_name
+                    
+                        if owner_info.get("type") == constants.ORGANIZATION_TYPE:
+                            return (
+                                owner_info.get("username"),
+                                project_slug,
+                                constants.ORGANIZATION_TYPE,
+                            )
+                        else:
+                            return (
+                                creator_info.get("username"),
+                                project_slug,
+                                constants.USER_TYPE,
+                            )
+        except Exception as e:
+            logging.warning("V2 API failed, falling back to V1: %s", str(e))
+
+        # ----------- Fallback to V1 API -----------
+        next_page_exists = True
+        offset = 0
+        project_list = []
+
+        # Handle Pagination if exists
+        while next_page_exists:
+            # Note - projectName param makes LIKE query not the exact match
+            endpoint = Template(ApiV1Endpoints.PROJECTS_SUMMARY.value).substitute(
+                username=self.username,
+                projectName=self.project_name,
+                limit=constants.MAX_API_PAGE_LENGTH,
+                offset=offset * constants.MAX_API_PAGE_LENGTH,
+            )
+            logging.info("Endpoint: %s", endpoint)
+            response = call_api_v1(
+                host=self.host,
+                endpoint=endpoint,
+                method="GET",
+                api_key=self.api_key,
+                ca_path=self.ca_path,
+                skip_tls_verification=self.skip_tls_verification,
+            )
+
+            """
+            End loop            
+            a. If response len is less than MAX_API_PAGE_LENGTH 
+                => Possible if less number of records
+                => Possible if response is [] => len 0             
+            b. If length of response is greater than MAX_API_PAGE_LENGTH => If source is CDSW, as CDSW doesn't honor limit
+            c. If CDSW non-paginated response length is exactly the MAX_API_PAGE_LENGTH
+            """
+            if len(response.json()) != constants.MAX_API_PAGE_LENGTH:
+                next_page_exists = False
+            else:
+                # Handling if CDSW non-paginated response length is MAX_API_PAGE_LENGTH
+                if project_list == response.json():
+                    break
+
+            project_list = project_list + response.json()
+            offset += 1
+
         if project_list:
             for project in project_list:
-                if project["name"] == self.project_name:
-                    # V2 API structure
-                    owner_info = project.get("owner", {})
-                    creator_info = project.get("creator", {})
-                    
-                    # V2 API uses project name as slug (V1 had slug_raw field but V2 doesn't)
-                    project_slug = project.get("slug") or project.get("slug_raw") or self.project_name
-                    
-                    if owner_info.get("type") == constants.ORGANIZATION_TYPE:
-                        return (
-                            owner_info.get("username"),
-                            project_slug,
-                            constants.ORGANIZATION_TYPE,
-                        )
-                    else:
-                        return (
-                            creator_info.get("username"),
-                            project_slug,
-                            constants.USER_TYPE,
-                        )
+                if project["name"] == self.project_name and project["owner"]["username"] == self.project_owner_username:
+                    return project.get("creator", {}).get("username", ""), project.get("slug_raw", ""), project.get("owner", {}).get("type", "")
         return None, None, None
     
     # Get all models list info using API v2
@@ -761,6 +821,7 @@ class ProjectExporter(BaseWorkspaceInteractor):
                 method="GET",
                 user_token=self.apiv2_key,
                 ca_path=self.ca_path,
+                skip_tls_verification=self.skip_tls_verification,
             )
             result = response.json()
             all_runtimes.extend(result.get("runtimes", []))
@@ -830,20 +891,21 @@ class ProjectExporter(BaseWorkspaceInteractor):
             rsync_enabled_runtime_id = -1
             project_uses_runtimes = is_project_configured_with_runtimes(
                 host=self.host,
-                username=self.username,
+                username=self.project_owner_username,
                 project_name=self.project_name,
                 api_key=self.api_key,
                 ca_path=self.ca_path,
                 project_slug=self.project_slug,
+                skip_tls_verification=self.skip_tls_verification,
             )
             if project_uses_runtimes:
                 rsync_enabled_runtime_id = get_rsync_enabled_runtime_id(
-                    host=self.host, api_key=self.api_key, ca_path=self.ca_path
+                    host=self.host, api_key=self.api_key, ca_path=self.ca_path, skip_tls_verification=self.skip_tls_verification
                 )
                 if rsync_enabled_runtime_id == -1:
                     logging.error("Project is configured with runtimes but no runtime available for SSH session")
                     raise RuntimeError("Cannot create SSH session: no runtime available")
-            cdswctl_path = obtain_cdswctl(host=self.host, ca_path=self.ca_path)
+            cdswctl_path = obtain_cdswctl(host=self.host, ca_path=self.ca_path, skip_tls_verification=self.skip_tls_verification)
             login_response = cdswctl_login(
                 cdswctl_path=cdswctl_path,
                 host=self.host,
@@ -863,18 +925,19 @@ class ProjectExporter(BaseWorkspaceInteractor):
                 cdswctl_path=cdswctl_path,
                 project_name=self.project_name,
                 runtime_id=rsync_enabled_runtime_id,
-                project_slug=self.project_slug,
+                project_slug="/".join([self.project_owner_username, self.project_slug]),
             )
             self._ssh_subprocess = ssh_subprocess
             exclude_file_path = get_ignore_files(
                 host=self.host,
-                username=self.username,
+                username=self.project_owner_username,
                 project_name=self.project_name,
                 api_key=self.api_key,
                 ca_path=self.ca_path,
                 ssh_port=port,
                 project_slug=self.project_slug,
                 top_level_dir=self.top_level_dir,
+                skip_tls_verification=self.skip_tls_verification,
             )
             test_file_size(
                 sshport=port,
@@ -907,16 +970,17 @@ class ProjectExporter(BaseWorkspaceInteractor):
         rsync_enabled_runtime_id = -1
         if is_project_configured_with_runtimes(
             host=self.host,
-            username=self.username,
+            username=self.project_owner_username,
             project_name=self.project_name,
             api_key=self.api_key,
             ca_path=self.ca_path,
             project_slug=self.project_slug,
+            skip_tls_verification=self.skip_tls_verification,
         ):
             rsync_enabled_runtime_id = get_rsync_enabled_runtime_id(
-                host=self.host, api_key=self.api_key, ca_path=self.ca_path
+                host=self.host, api_key=self.api_key, ca_path=self.ca_path, skip_tls_verification=self.skip_tls_verification
             )
-        cdswctl_path = obtain_cdswctl(host=self.host, ca_path=self.ca_path)
+        cdswctl_path = obtain_cdswctl(host=self.host, ca_path=self.ca_path, skip_tls_verification=self.skip_tls_verification)
         login_response = cdswctl_login(
             cdswctl_path=cdswctl_path,
             host=self.host,
@@ -933,7 +997,7 @@ class ProjectExporter(BaseWorkspaceInteractor):
             cdswctl_path=cdswctl_path,
             project_name=self.project_name,
             runtime_id=rsync_enabled_runtime_id,
-            project_slug=self.project_slug,
+            project_slug="/".join([self.project_owner_username, self.project_slug]),
         )
         self._ssh_subprocess = ssh_subprocess
         exclude_file_path = get_ignore_files(
@@ -945,6 +1009,7 @@ class ProjectExporter(BaseWorkspaceInteractor):
             ssh_port=port,
             project_slug=self.project_slug,
             top_level_dir=self.top_level_dir,
+            skip_tls_verification=self.skip_tls_verification,
         )
         result = verify_files(
             sshport=port,
@@ -1051,6 +1116,7 @@ print("Please update the application script path in CML UI")
 
         project_metadata["template"] = "blank"
         project_metadata["environment"] = project_env
+        project_metadata["original_owner_username"] = self.project_owner_username
 
         # Create project in team context
         if self.owner_type == constants.ORGANIZATION_TYPE:
@@ -1381,13 +1447,14 @@ class ProjectImporter(BaseWorkspaceInteractor):
         top_level_dir: str,
         ca_path: str,
         project_slug: str,
+        skip_tls_verification: bool = False,
         apiv2_key: str = None,
     ) -> None:
         self._ssh_subprocess = None
         self.top_level_dir = top_level_dir
         self.project_id = None  # Will be populated from API
         self._original_owner_username = None  # Cache for owner restoration
-        super().__init__(host, username, project_name, api_key, ca_path, project_slug, apiv2_key)
+        super().__init__(host, username, project_name, api_key, ca_path, project_slug, skip_tls_verification, apiv2_key)
         self.metrics_data = dict()
         # Track import outcomes for applications
         self.import_tracking = {
@@ -1412,6 +1479,7 @@ class ProjectImporter(BaseWorkspaceInteractor):
             method="GET",
             user_token=self.apiv2_key,
             ca_path=self.ca_path,
+            skip_tls_verification=self.skip_tls_verification,
         )
         project_list = response.json()["projects"]
         
@@ -1434,6 +1502,7 @@ class ProjectImporter(BaseWorkspaceInteractor):
                 method="GET",
                 user_token=self.apiv2_key,
                 ca_path=self.ca_path,
+                skip_tls_verification=self.skip_tls_verification,
             )
             all_projects = response_all.json()["projects"]
             
@@ -1592,9 +1661,9 @@ class ProjectImporter(BaseWorkspaceInteractor):
                 logging.info("Project ID not found, proceeding without owner change (new project will be created)")
             
             rsync_enabled_runtime_id = get_rsync_enabled_runtime_id(
-                host=self.host, api_key=self.apiv2_key, ca_path=self.ca_path
+                host=self.host, api_key=self.apiv2_key, ca_path=self.ca_path, skip_tls_verification=self.skip_tls_verification
             )
-            cdswctl_path = obtain_cdswctl(host=self.host, ca_path=self.ca_path)
+            cdswctl_path = obtain_cdswctl(host=self.host, ca_path=self.ca_path, skip_tls_verification=self.skip_tls_verification)
             login_response = cdswctl_login(
                 cdswctl_path=cdswctl_path,
                 host=self.host,
@@ -1662,9 +1731,9 @@ class ProjectImporter(BaseWorkspaceInteractor):
 
     def verify_project(self, log_filedir: str):
         rsync_enabled_runtime_id = get_rsync_enabled_runtime_id(
-            host=self.host, api_key=self.apiv2_key, ca_path=self.ca_path
+            host=self.host, api_key=self.apiv2_key, ca_path=self.ca_path, skip_tls_verification=self.skip_tls_verification
         )
-        cdswctl_path = obtain_cdswctl(host=self.host, ca_path=self.ca_path)
+        cdswctl_path = obtain_cdswctl(host=self.host, ca_path=self.ca_path, skip_tls_verification=self.skip_tls_verification)
         login_response = cdswctl_login(
             cdswctl_path=cdswctl_path,
             host=self.host,
@@ -1726,7 +1795,7 @@ class ProjectImporter(BaseWorkspaceInteractor):
     def convert_project_to_engine_based(self, proj_patch_metadata) -> bool:
         try:
             endpoint2 = Template(ApiV1Endpoints.PROJECT.value).substitute(
-                username=self.username, project_name=self.project_name
+                owner=self.username, project_name=self.project_name
             )
             response = call_api_v1(
                 host=self.host,
@@ -1735,6 +1804,7 @@ class ProjectImporter(BaseWorkspaceInteractor):
                 api_key=self.api_key,
                 json_data=proj_patch_metadata,
                 ca_path=self.ca_path,
+                skip_tls_verification=self.skip_tls_verification,
             )
             return True
         except KeyError as e:
@@ -1863,6 +1933,7 @@ class ProjectImporter(BaseWorkspaceInteractor):
                 method="GET",
                 user_token=self.apiv2_key,
                 ca_path=self.ca_path,
+                skip_tls_verification=self.skip_tls_verification,
             )
             result = response.json()
             all_runtimes.extend(result.get("runtimes", []))
@@ -1887,6 +1958,7 @@ class ProjectImporter(BaseWorkspaceInteractor):
             method="GET",
             user_token=self.apiv2_key,
             ca_path=self.ca_path,
+            skip_tls_verification=self.skip_tls_verification,
         )
         result_list = response.json()["runtime_addons"]
         if result_list:
@@ -1926,6 +1998,7 @@ class ProjectImporter(BaseWorkspaceInteractor):
                 method="GET",
                 user_token=self.apiv2_key,
                 ca_path=self.ca_path,
+                skip_tls_verification=self.skip_tls_verification,
             )
             project_list = response.json()["projects"]
             if project_list:
@@ -1952,6 +2025,7 @@ class ProjectImporter(BaseWorkspaceInteractor):
                 method="GET",
                 user_token=self.apiv2_key,
                 ca_path=self.ca_path,
+                skip_tls_verification=self.skip_tls_verification,
             )
             model_list = response.json()["models"]
             if model_list:
@@ -2005,6 +2079,7 @@ class ProjectImporter(BaseWorkspaceInteractor):
                 method="GET",
                 user_token=self.apiv2_key,
                 ca_path=self.ca_path,
+                skip_tls_verification=self.skip_tls_verification,
             )
             app_list = response.json()["applications"]
             if app_list:
@@ -2026,6 +2101,7 @@ class ProjectImporter(BaseWorkspaceInteractor):
             method="GET",
             user_token=self.apiv2_key,
             ca_path=self.ca_path,
+            skip_tls_verification=self.skip_tls_verification,
         )
         return response.json()
 
@@ -2039,6 +2115,7 @@ class ProjectImporter(BaseWorkspaceInteractor):
             method="GET",
             user_token=self.apiv2_key,
             ca_path=self.ca_path,
+            skip_tls_verification=self.skip_tls_verification,
         )
         return response.json()
 
@@ -2052,6 +2129,7 @@ class ProjectImporter(BaseWorkspaceInteractor):
             method="GET",
             user_token=self.apiv2_key,
             ca_path=self.ca_path,
+            skip_tls_verification=self.skip_tls_verification,
         )
         return response.json()
 
@@ -2065,6 +2143,7 @@ class ProjectImporter(BaseWorkspaceInteractor):
             method="GET",
             user_token=self.apiv2_key,
             ca_path=self.ca_path,
+            skip_tls_verification=self.skip_tls_verification,
         )
         return response.json()
 
@@ -2523,6 +2602,7 @@ class ProjectImporter(BaseWorkspaceInteractor):
                 api_key=self.api_key,
                 ca_path=self.ca_path,
                 project_slug=self.project_slug,
+                skip_tls_verification=self.skip_tls_verification,
             )
             
             if verbose:
@@ -2718,6 +2798,7 @@ class ProjectImporter(BaseWorkspaceInteractor):
                 api_key=self.api_key,
                 ca_path=self.ca_path,
                 project_slug=self.project_slug,
+                skip_tls_verification=self.skip_tls_verification,
             )
             app_metadata_list = read_json_file(app_metadata_filepath)
             if app_metadata_list != None:
@@ -2954,6 +3035,7 @@ class ProjectImporter(BaseWorkspaceInteractor):
                 api_key=self.api_key,
                 ca_path=self.ca_path,
                 project_slug=self.project_slug,
+                skip_tls_verification=self.skip_tls_verification,
             )
             
             # Initialize job tracking
@@ -3127,6 +3209,7 @@ class ProjectImporter(BaseWorkspaceInteractor):
             method="GET",
             user_token=self.apiv2_key,
             ca_path=self.ca_path,
+            skip_tls_verification=self.skip_tls_verification,
         )
         return response.json()
 
